@@ -38,7 +38,7 @@ import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
@@ -177,6 +177,7 @@ import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.j
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
+import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
@@ -6579,6 +6580,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
   '                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，',
@@ -8408,7 +8410,7 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--as', '--plugin-card-action']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -9271,6 +9273,24 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
   const effectiveResponseKind = responseKind ?? 'progress';
+  const expectedLinks = argValues(rest, '--expected-link');
+  if (rest.some((token, index) => token === '--expected-link='
+    || (token === '--expected-link'
+      && (rest[index + 1] === undefined || rest[index + 1]!.startsWith('--'))))) {
+    console.error('botmux send: --expected-link 需要 URL 参数');
+    process.exit(2);
+  }
+  for (const expectedLink of expectedLinks) {
+    let url: URL;
+    try { url = new URL(expectedLink); } catch {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+  }
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -9753,6 +9773,45 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Keep memory attribution in the model's rollout, but never render the
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
+  // Validate the exact presentation text before any TTS, upload, contact
+  // lookup, or message-provider effect. A sandbox relay may provide a
+  // host-private prepared Markdown copy, so use the same precedence as the
+  // eventual card renderer rather than trusting the raw source alone.
+  let expectedLinkRenderedContent = extractCardText(content);
+  if (customCard) {
+    const { extractCardContent } = await import('./im/lark/message-parser.js');
+    expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
+  }
+  const expectedLinkPreparedFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  if (!customCard && expectedLinkPreparedFile) {
+    try { expectedLinkRenderedContent = readFileSync(expectedLinkPreparedFile, 'utf-8'); }
+    catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
+  }
+  const fileOnlyPrimaryRequested = !customCard
+    && !expectedLinkRenderedContent.trim()
+    && !asChoice
+    && images.length === 0
+    && files.length === 1
+    && videoAttachments.length === 0
+    && mentionArgs.length === 0
+    && !mentionBack;
+  // A file-only final intentionally has no card body. Its attachment is the
+  // user-visible primary content, so expected-link validation and the turn
+  // fingerprint must cover the exact bytes that will be uploaded. Read before
+  // any provider effect; an unreadable attachment therefore fails cleanly.
+  const linkValidationContent = fileOnlyPrimaryRequested
+    ? readFileSync(files[0], 'utf8')
+    : expectedLinkRenderedContent;
+  for (const expectedLink of expectedLinks) {
+    if (!linkValidationContent.includes(expectedLink)) {
+      console.error(`botmux send: expected link missing from rendered content: ${expectedLink}`);
+      process.exit(2);
+    }
+  }
+  if (fileOnlyPrimaryRequested) {
+    const attachmentBytes = readFileSync(files[0]);
+    expectedLinkRenderedContent = `file-only:sha256:${createHash('sha256').update(attachmentBytes).digest('hex')}`;
+  }
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
   if (asChoice) {
     content = embedCrossPrincipalAsToken(
@@ -9803,6 +9862,36 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const turnSendKey = currentTurnId
+    ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt }
+    : undefined;
+  const turnSendLedger = new TurnSendLedger(dataDir);
+  const executeTurnPrimary = async (
+    renderedContent: string,
+    dispatch: (providerUuid?: string) => Promise<string>,
+  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
+    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
+    : { messageId: await dispatch(), replayed: false };
+  let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
+  try {
+    existingTurnPrimary = turnSendKey
+      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, expectedLinkRenderedContent)
+      : undefined;
+  } catch (error) {
+    console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
+  if (existingTurnPrimary) {
+    console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
+    console.log(JSON.stringify({
+      success: true,
+      messageId: existingTurnPrimary.messageId,
+      sessionId: sid,
+      turnId: currentTurnId,
+      replayed: true,
+    }));
+    return;
+  }
   // Resolve sender-scoped bot identities before the early voice return. Voice
   // used to skip the text path's XPI gate entirely, so an explicitly addressed
   // bot received an unclassified bot message that the receiver then dropped.
@@ -9857,107 +9946,105 @@ async function cmdSend(rest: string[]): Promise<void> {
     const { synthesizeVoiceOpus } = await import('./services/voice/index.js');
     const { rmSync } = await import('node:fs');
     const targetChatId = overrideChatId ?? s.chatId;
+    let voicePrimaryOutputChatId = targetChatId;
     let dir: string | undefined;
+    let voiceDurationMs: number | undefined;
     try {
-      await revalidateIsolatedOriginBeforeEffect();
-      const out = await synthesizeVoiceOpus(appId, content, {
-        beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
-      });
-      dir = out.dir;
-      await revalidateIsolatedOriginBeforeEffect();
-      const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
-      const sentAtMs = Date.now();
-      const proposedOutput = {
-        targetChatId,
-        msgType: 'audio',
-        content: JSON.stringify({ file_key: fileKey }),
-      };
-      const prepared = prepareVcMeetingListenerReply(proposedOutput);
-      if (prepared?.kind === 'conflict') {
-        throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
-      }
-      const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
-      if (prepared?.outputMismatch) {
-        console.error(
-          `⚠️ VC listener voice reply output_mismatch action=${prepared.ref.actionId}; `
-          + 'reusing first canonical output',
-        );
-      }
-      let messageId: string;
-      if (prepared?.kind === 'succeeded' && prepared.messageId) {
-        messageId = prepared.messageId;
-      } else {
-        revalidateVcMeetingManagedSend();
-        const managedProviderOptions = outboundMessageOptions(!!prepared);
-        const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
-          ? await dispatchDeferredTopicSend({
-              dataDir: resolveDataDir(),
-              session: s as SessionData & { larkAppId: string },
-              currentTurnId,
-              explicitTopLevel: sendTopLevel,
-              reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
-              content: canonicalOutput.content,
-              msgType: canonicalOutput.msgType,
-              uuid: prepared?.providerKey,
-              sendRoot: async (body, type, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
-              },
-              sendTitleSeed: async (title, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return sendMessage(appId, targetChatId, title, 'text', uuid);
-              },
-              replyRoot: async (root, body, type, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
-              },
-            })
-          : { handled: false };
-        if (deferred.handled && deferred.messageId) {
-          deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
-          deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
-          messageId = deferred.messageId;
+      const voiceDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+        await revalidateIsolatedOriginBeforeEffect();
+        const out = await synthesizeVoiceOpus(appId, content, {
+          beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+        });
+        dir = out.dir;
+        voiceDurationMs = out.durationMs;
+        await revalidateIsolatedOriginBeforeEffect();
+        const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
+        const proposedOutput = {
+          targetChatId,
+          msgType: 'audio',
+          content: JSON.stringify({ file_key: fileKey }),
+        };
+        const prepared = prepareVcMeetingListenerReply(proposedOutput);
+        if (prepared?.kind === 'conflict') {
+          throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
+        }
+        const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
+        voicePrimaryOutputChatId = canonicalOutput.targetChatId;
+        if (prepared?.outputMismatch) {
+          console.error(
+            `⚠️ VC listener voice reply output_mismatch action=${prepared.ref.actionId}; `
+            + 'reusing first canonical output',
+          );
+        }
+        let deliveredMessageId: string;
+        if (prepared?.kind === 'succeeded' && prepared.messageId) {
+          deliveredMessageId = prepared.messageId;
         } else {
-          const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
-            ? frozenTurnReplyTarget
-            : resolveSendTarget({
-                into: sendInto,
-                topLevel: sendTopLevel,
-                chatScope: s.scope === 'chat',
-                chatId: canonicalOutput.targetChatId,
-                rootMessageId: s.rootMessageId,
-                replyTargetRootId: turnReplyTarget?.rootMessageId,
-                replyTargetTurnId: turnReplyTarget?.turnId,
-                replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          revalidateVcMeetingManagedSend();
+          const managedProviderOptions = outboundMessageOptions(!!prepared);
+          const deliveryUuid = prepared?.providerKey ?? providerUuid;
+          const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+            ? await dispatchDeferredTopicSend({
+                dataDir: resolveDataDir(),
+                session: s as SessionData & { larkAppId: string },
                 currentTurnId,
-              });
-          await revalidateIsolatedOriginBeforeEffect();
-          messageId = canonicalTarget.mode === 'plain'
-            ? await sendMessage(
-                appId,
-                canonicalTarget.chatId,
-                canonicalOutput.content,
-                canonicalOutput.msgType,
-                prepared?.providerKey,
-                undefined,
-                managedProviderOptions,
-              )
-            : await replyMessage(
-                appId,
-                canonicalTarget.rootMessageId,
-                canonicalOutput.content,
-                canonicalOutput.msgType,
-                canonicalTarget.mode === 'thread',
-                prepared?.providerKey,
-                undefined,
-                managedProviderOptions,
-              );
+                explicitTopLevel: sendTopLevel,
+                reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+                content: canonicalOutput.content,
+                msgType: canonicalOutput.msgType,
+                uuid: deliveryUuid,
+                sendRoot: async (body, type, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
+                },
+                sendTitleSeed: async (title, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return sendMessage(appId, targetChatId, title, 'text', uuid);
+                },
+                replyRoot: async (root, body, type, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
+                },
+              })
+            : { handled: false };
+          if (deferred.handled && deferred.messageId) {
+            deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
+            deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
+            deliveredMessageId = deferred.messageId;
+          } else {
+            const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+              ? frozenTurnReplyTarget
+              : resolveSendTarget({
+                  into: sendInto,
+                  topLevel: sendTopLevel,
+                  chatScope: s.scope === 'chat',
+                  chatId: canonicalOutput.targetChatId,
+                  rootMessageId: s.rootMessageId,
+                  replyTargetRootId: turnReplyTarget?.rootMessageId,
+                  replyTargetTurnId: turnReplyTarget?.turnId,
+                  replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+                  currentTurnId,
+                });
+            await revalidateIsolatedOriginBeforeEffect();
+            deliveredMessageId = canonicalTarget.mode === 'plain'
+              ? await sendMessage(
+                  appId, canonicalTarget.chatId, canonicalOutput.content, canonicalOutput.msgType,
+                  deliveryUuid, undefined, managedProviderOptions,
+                )
+              : await replyMessage(
+                  appId, canonicalTarget.rootMessageId, canonicalOutput.content, canonicalOutput.msgType,
+                  canonicalTarget.mode === 'thread', deliveryUuid, undefined, managedProviderOptions,
+                );
+          }
+          if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
+            finishVcMeetingImReply(resolveDataDir(), prepared.ref, deliveredMessageId);
+          }
         }
-        if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
-          finishVcMeetingImReply(resolveDataDir(), prepared.ref, messageId);
-        }
-      }
-      recordVcMeetingPrimaryOutput(messageId, canonicalOutput.targetChatId);
+        return deliveredMessageId;
+      });
+      const messageId = voiceDelivery.messageId;
+      const sentAtMs = Date.now();
+      recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次回复：写 bridge fallback marker，否则本轮会被判为"没发 botmux send"
       // 而触发兜底，多补一张文本卡。与文本/卡片路径同口径：仅同话题回复才记。
       if ((!sendTopLevel || !!deferredTopicRootMessageIdForOutput)
@@ -9978,13 +10065,16 @@ async function cmdSend(rest: string[]): Promise<void> {
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
-      console.error(`✓ 已发送语音 ${messageId} ｜ ${Math.round(out.durationMs / 1000)}s`);
+      console.error(voiceDelivery.replayed
+        ? `✓ 已复用本轮已发送语音 ${messageId}`
+        : `✓ 已发送语音 ${messageId} ｜ ${Math.round((voiceDurationMs ?? 0) / 1000)}s`);
       console.log(JSON.stringify({
         success: true,
         messageId,
         sessionId: sid,
         kind: 'voice',
-        durationMs: out.durationMs,
+        durationMs: voiceDurationMs,
+        replayed: voiceDelivery.replayed,
         ...(deferredTopicRootMessageIdForOutput
           ? { deferredTopicRootMessageId: deferredTopicRootMessageIdForOutput, turnId: currentTurnId }
           : {}),
@@ -10028,17 +10118,40 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
-      for (let i = 0; i < chunks.length; i++) {
-        await replyToDocComment(
-          appId,
-          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
-          exactDocTarget.commentId,
-          chunks[i],
-          i === 0 ? docMentionOpenId : undefined,
-          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
-        );
-      }
-      // 清理 "Typing" reaction（bot 已回复完毕）。
+      const docMessageId = `doc:${exactDocTarget.commentId}`;
+      const docDelivery = turnSendKey
+        ? await turnSendLedger.executeNonIdempotentSequence(
+            turnSendKey,
+            effectiveResponseKind,
+            expectedLinkRenderedContent,
+            chunks.length,
+            async i => {
+              await replyToDocComment(
+                appId,
+                { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+                exactDocTarget.commentId,
+                chunks[i],
+                i === 0 ? docMentionOpenId : undefined,
+                { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+              );
+            },
+            docMessageId,
+          )
+        : await (async () => {
+            for (let i = 0; i < chunks.length; i++) {
+              await replyToDocComment(
+                appId,
+                { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+                exactDocTarget.commentId,
+                chunks[i],
+                i === 0 ? docMentionOpenId : undefined,
+                { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+              );
+            }
+            return { messageId: docMessageId, replayed: false };
+          })();
+      // 清理 "Typing" reaction（bot 已回复完毕）。未知分块会在上方 fail closed，
+      // 不会误删指示器并把一份可能不完整的回复伪装成完成。
       if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
           { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
@@ -10051,7 +10164,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
-          messageId: `doc:${exactDocTarget.commentId}`,
+          messageId: docDelivery.messageId,
           responseKind: effectiveResponseKind,
           ...(originTurnId ? { turnId: originTurnId } : {}),
           ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
@@ -10065,7 +10178,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the daemon may have advanced the dispatch ledger or accepted another
       // turn in the meantime.  Daemon settlement owns exact target retirement.
       console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
-      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
+      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length, replayed: docDelivery.replayed }));
     } catch (e: any) {
       console.error(`文档评论发送失败：${describeSendFailure(e)}`);
       process.exit(1);
@@ -10566,7 +10679,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
-  const dispatchPrimary = async (
+  const dispatchPrimaryUnlocked = async (
     content: string,
     msgType: string,
     originAlreadyRevalidated = false,
@@ -10660,6 +10773,25 @@ async function cmdSend(rest: string[]): Promise<void> {
       finishVcMeetingImReply(resolveDataDir(), prepared.ref, result.messageId);
     }
     recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);
+    return result.messageId;
+  };
+  let turnPrimaryReplayed = false;
+  const dispatchPrimary = async (
+    primaryContent: string,
+    msgType: string,
+    originAlreadyRevalidated = false,
+    uuid?: string,
+  ): Promise<string> => {
+    const result = await executeTurnPrimary(
+      expectedLinkRenderedContent,
+      providerUuid => dispatchPrimaryUnlocked(
+        primaryContent,
+        msgType,
+        originAlreadyRevalidated,
+        uuid ?? providerUuid,
+      ),
+    );
+    turnPrimaryReplayed ||= result.replayed;
     return result.messageId;
   };
 
@@ -10885,6 +11017,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // assert "one id per requested attachment" instead of guessing.
     let attachmentMessageIds: string[] = [];
     let videoMessageIds: string[] = [];
+    const pureFileSend = fileOnlyPrimaryRequested
+      && !text.trim()
+      && imageKeys.length === 0
+      && mentions.length === 0;
     const pureVideoSend = customCard
       ? false
       : shouldSendAsPureVideo({
@@ -10894,8 +11030,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           videoCount: videoAttachments.length,
           mentionCount: mentions.length,
         });
-    if (pureVideoSend && replyLayout) {
-      console.error('botmux send: --layout 不作用于纯视频消息，本次已忽略');
+    if ((pureFileSend || pureVideoSend) && replyLayout) {
+      console.error(`botmux send: --layout 不作用于纯${pureFileSend ? '文件' : '视频'}消息，本次已忽略`);
       replyLayout = undefined;
     }
     if (customCard) {
@@ -10913,6 +11049,23 @@ async function cmdSend(rest: string[]): Promise<void> {
       const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
       const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
       messageId = await dispatchPrimary(slashText, 'text');
+    } else if (pureFileSend) {
+      // The single attachment IS the primary message. Keep upload + send under
+      // the turn ledger lock so a concurrent final cannot upload or post a
+      // duplicate, and never emit an empty interactive card first.
+      const fileDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+        await revalidateIsolatedOriginBeforeEffect();
+        const fileKey = await uploadFile(appId, files[0]);
+        return dispatchPrimaryUnlocked(
+          JSON.stringify({ file_key: fileKey }),
+          'file',
+          false,
+          providerUuid,
+        );
+      });
+      turnPrimaryReplayed ||= fileDelivery.replayed;
+      messageId = fileDelivery.messageId;
+      attachmentMessageIds = [messageId];
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
@@ -11085,40 +11238,62 @@ async function cmdSend(rest: string[]): Promise<void> {
       const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
-        const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
-          ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
-              ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
-          : { kind: 'progress', text }, {
-          beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
-          send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
-          patch: async (id, body) => {
-            const { updateMessage } = await import('./im/lark/client.js');
-            await updateMessage(appId, id, body);
-          },
-          isWithdrawn: error => error instanceof MessageWithdrawnError,
-          render: record => buildTurnReplyCard(record, {
-            ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
-            showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
-            canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
-          }),
-          sendOverflow: async (fullText, uuid) => {
-            const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
-            writeFileSync(path, fullText, { mode: 0o600 });
-            await revalidateIsolatedOriginBeforeEffect();
-            const fileKey = await uploadFile(appId, path);
-            return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
-          },
+        let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        const replyDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+          delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
+            ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
+                ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
+            : { kind: 'progress', text }, {
+            beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
+            patch: async (id, body) => {
+              const { updateMessage } = await import('./im/lark/client.js');
+              await updateMessage(appId, id, body);
+            },
+            isWithdrawn: error => error instanceof MessageWithdrawnError,
+            render: record => buildTurnReplyCard(record, {
+              ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
+              showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
+              canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
+            }),
+            sendOverflow: async (fullText, uuid) => {
+              const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
+              writeFileSync(path, fullText, { mode: 0o600 });
+              await revalidateIsolatedOriginBeforeEffect();
+              const fileKey = await uploadFile(appId, path);
+              return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+            },
+          });
+          return delivered.messageId ?? '';
         });
+        turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
-        if (!delivered.delivered || !delivered.messageId) {
+        if (!replyDelivery.messageId) {
           console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
-        messageId = delivered.messageId;
+        messageId = replyDelivery.messageId;
       } else {
         messageId = await dispatchPrimary(replyCardJson, 'interactive');
       }
+    }
+
+    // The cheap preflight above catches ordinary retries. A concurrent retry
+    // can still reach the publication lock before the first sender records its
+    // result; in that case executeTurnPrimary returns the canonical message id
+    // after waiting. Stop here so the losing process cannot repeat indexing,
+    // attachments, urgency, bridge markers, or attention side effects.
+    if (turnPrimaryReplayed) {
+      console.error(`✓ 已复用本轮最终回答 ${messageId}`);
+      console.log(JSON.stringify({
+        success: true,
+        messageId,
+        sessionId: sid,
+        turnId: currentTurnId,
+        replayed: true,
+      }));
+      return;
     }
 
     if (oncallGroupCard && messageId) {
@@ -11137,7 +11312,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // canonical final-answer cards — and they are exactly the shapes the
     // feedback gate above rejects outright, so the recorded set stays identical
     // whether feedback is on or off.
-    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
@@ -11212,7 +11387,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
-    if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
+    if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
       ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
         { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));

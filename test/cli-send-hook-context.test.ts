@@ -617,6 +617,19 @@ describe('cmdSend hook context wiring', () => {
     expect(docSend).not.toMatch(/delete\s+exactDocSession\.docCommentTargets/);
   });
 
+  it('checkpoints document comment chunks before each non-idempotent provider call', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const docSendStart = cmdSend.indexOf('if (isOriginDocCommentTurn)', cmdSend.indexOf('// Read content from:'));
+    const mentionParsing = cmdSend.indexOf('// Parse mentions:', docSendStart);
+    const docSend = cmdSend.slice(docSendStart, mentionParsing);
+
+    expect(docSend).toContain('executeNonIdempotentSequence(');
+    expect(docSend).not.toMatch(/executeTurnPrimary\([\s\S]*?for \(let i = 0; i < chunks\.length; i\+\+\)/);
+    expect(docSend.indexOf('removeCommentReaction(')).toBeGreaterThan(docSend.indexOf('executeNonIdempotentSequence('));
+  });
+
   it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
     // 2+ distinct counterparts OR an incomplete window → block --mention-back and
     // hand the model explicit --mention candidates. Reads the persisted
@@ -645,7 +658,7 @@ describe('cmdSend hook context wiring', () => {
     );
     expect(cmdSend).toMatch(/const dispatch = async \([^)]*\): Promise<string> => \{[\s\S]*?dispatchAfterOriginGate\(/);
     expect(cmdSend).toMatch(
-      /const dispatchPrimary = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,
+      /const dispatchPrimaryUnlocked = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,
     );
     expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);');
     expect(cmdSend.indexOf('recordVcMeetingPrimaryOutput(result.messageId'))
@@ -671,7 +684,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('const managedCustomCardError = managedVcCustomCardError(');
     expect(cmdSend).toMatch(/sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin\s*\? undefined/);
     expect(cmdSend).toContain('const prepared = prepareVcMeetingListenerReply(proposedOutput);');
-    expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?prepared\?\.providerKey/);
+    expect(cmdSend).toContain('const deliveryUuid = prepared?.providerKey ?? providerUuid;');
+    expect(cmdSend).toContain('voicePrimaryOutputChatId = canonicalOutput.targetChatId;');
+    expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);');
+    expect(cmdSend).not.toContain('recordVcMeetingPrimaryOutput(messageId, targetChatId);');
+    expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?deliveryUuid/);
     expect(cmdSend).toContain('...(prepared ? { suppressHook: true } : {})');
     expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
@@ -709,9 +726,9 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
-    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     expect(oncallIndex).toBeGreaterThan(primarySend);
     expect(oncallIndex).toBeLessThan(completionIndex);
     // The feedback control (policy + card snapshot) rides along only when a
@@ -721,5 +738,18 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
     expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
+  });
+
+  it('returns after a concurrent final replay before any post-primary side effects', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const replayReturn = cmdSend.indexOf('if (turnPrimaryReplayed) {');
+    const oncallDelivery = cmdSend.indexOf('if (oncallGroupCard && messageId)');
+
+    expect(replayReturn).toBeGreaterThan(cmdSend.indexOf('messageId = await dispatchPrimary'));
+    expect(replayReturn).toBeLessThan(oncallDelivery);
+    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('replayed: true');
+    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('return;');
   });
 });

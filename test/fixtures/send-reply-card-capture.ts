@@ -6,6 +6,8 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
   let data;
   if (url.pathname.includes('/auth/')) {
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };
+  } else if (url.pathname.includes('/im/v1/files')) {
+    data = { code: 0, data: { file_key: 'file_test_upload' } };
   } else if (url.pathname.includes('/im/v1/messages') && ['POST', 'PATCH'].includes(method)) {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
