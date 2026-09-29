@@ -6645,6 +6645,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   mojo-containment list|revoke
               查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
+  turn-send-ledger inspect|resolve
+              查看文档评论分块投递账本；人工核实 provider 响应未知的分块后，
+              用 resolve --outcome delivered|not-delivered --yes 恢复后续重试
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -9914,6 +9917,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt }
     : undefined;
   const turnSendLedger = new TurnSendLedger(dataDir);
+  try {
+    await turnSendLedger.pruneCompletedIfDue();
+  } catch (error) {
+    // Retention is maintenance, never part of send correctness. Keep the
+    // completed/in-flight records fail-closed and let this send proceed.
+    logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
@@ -16209,6 +16219,11 @@ switch (command) {
     // never self-release (weak handles on non-cgroup hosts, unprovable handles).
     const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
     process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
+    break;
+  }
+  case 'turn-send-ledger': {
+    const { runTurnSendLedgerCommand } = await import('./core/turn-send-ledger-command.js');
+    process.exitCode = await runTurnSendLedgerCommand(process.argv.slice(3));
     break;
   }
   case 'list':

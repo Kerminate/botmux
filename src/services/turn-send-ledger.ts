@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { withFileLock } from '../utils/file-lock.js';
+import { FileLockTimeoutError, withFileLock } from '../utils/file-lock.js';
 
 export type TurnSendKind = 'progress' | 'final' | 'auxiliary';
 
@@ -34,6 +34,26 @@ export interface TurnSendLedgerResult {
   replayed: boolean;
 }
 
+export type TurnSendLedgerInspection = Pick<TurnSendLedgerKey, 'larkAppId' | 'sessionId' | 'turnId'> & (
+  | {
+      state: 'completed';
+      messageId: string;
+      deliveredAtMs: number;
+    }
+  | {
+      state: 'incomplete' | 'in_flight';
+      target: string;
+      stepCount: number;
+      completedSteps: number;
+      /** Human-facing one-based step number. */
+      inFlightStep?: number;
+    }
+);
+
+export const TURN_SEND_LEDGER_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const TURN_SEND_LEDGER_PRUNE_INTERVAL_MS = 24 * 60 * 60_000;
+const TURN_SEND_LEDGER_PRUNE_MARKER = '.completed-prune';
+
 /**
  * Cross-process final-answer fence for every primary `botmux send` path.
  *
@@ -64,19 +84,12 @@ export class TurnSendLedger {
     return createHash('sha256').update(content).digest('hex');
   }
 
-  private read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
-    const path = this.path(key);
-    if (!existsSync(path)) return undefined;
-    const directoryStat = lstatSync(this.directory);
-    const fileStat = lstatSync(path);
-    if (directoryStat.isSymbolicLink() || fileStat.isSymbolicLink() || !fileStat.isFile()) {
-      throw new Error('Unsafe turn-send ledger record');
-    }
-    const record = JSON.parse(readFileSync(path, 'utf8')) as TurnSendLedgerRecord;
-    if (record.version !== 1 || this.id(record) !== this.id(key)) {
+  private validateRecord(record: TurnSendLedgerRecord, expectedId: string): TurnSendLedgerRecord {
+    if (record.version !== 1 || this.id(record) !== expectedId) {
       throw new Error('Invalid turn-send ledger record');
     }
-    if (record.final && (!record.final.fingerprint || !record.final.messageId)) {
+    if (record.final && (!record.final.fingerprint || !record.final.messageId
+      || !Number.isFinite(record.final.deliveredAtMs))) {
       throw new Error('Invalid turn-send final record');
     }
     const sequence = record.nonIdempotentSequence;
@@ -99,12 +112,179 @@ export class TurnSendLedger {
     return record;
   }
 
+  private readPath(path: string): TurnSendLedgerRecord {
+    const directoryStat = lstatSync(this.directory);
+    const fileStat = lstatSync(path);
+    if (directoryStat.isSymbolicLink() || fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      throw new Error('Unsafe turn-send ledger record');
+    }
+    const file = basename(path);
+    if (!/^[a-f0-9]{32}\.json$/.test(file)) throw new Error('Invalid turn-send ledger filename');
+    const record = JSON.parse(readFileSync(path, 'utf8')) as TurnSendLedgerRecord;
+    return this.validateRecord(record, file.slice(0, -'.json'.length));
+  }
+
+  private read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
+    const path = this.path(key);
+    if (!existsSync(path)) return undefined;
+    return this.readPath(path);
+  }
+
   private write(key: TurnSendLedgerKey, record: TurnSendLedgerRecord): void {
     atomicWriteFileSync(this.path(key), JSON.stringify(record), {
       mode: 0o600,
       followTargetSymlink: false,
       durable: true,
     });
+  }
+
+  private inspection(record: TurnSendLedgerRecord): TurnSendLedgerInspection {
+    const identity = {
+      larkAppId: record.larkAppId,
+      sessionId: record.sessionId,
+      turnId: record.turnId,
+    };
+    if (record.final) {
+      return {
+        ...identity,
+        state: 'completed',
+        messageId: record.final.messageId,
+        deliveredAtMs: record.final.deliveredAtMs,
+      };
+    }
+    const sequence = record.nonIdempotentSequence;
+    if (!sequence) throw new Error('Invalid empty turn-send ledger record');
+    return {
+      ...identity,
+      state: sequence.inFlightStep === undefined ? 'incomplete' : 'in_flight',
+      target: sequence.target,
+      stepCount: sequence.stepCount,
+      completedSteps: sequence.completedSteps,
+      ...(sequence.inFlightStep === undefined ? {} : { inFlightStep: sequence.inFlightStep + 1 }),
+    };
+  }
+
+  /** Resolve hashed filenames back to operator-facing session/turn identities. */
+  inspect(filter: { larkAppId?: string; sessionId?: string; turnId?: string } = {}): TurnSendLedgerInspection[] {
+    if (!existsSync(this.directory)) return [];
+    const directoryStat = lstatSync(this.directory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error('Unsafe turn-send ledger directory');
+    }
+    const records: TurnSendLedgerInspection[] = [];
+    for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9]{32}\.json$/.test(name)).sort()) {
+      const record = this.readPath(join(this.directory, file));
+      if (filter.larkAppId && record.larkAppId !== filter.larkAppId) continue;
+      if (filter.sessionId && record.sessionId !== filter.sessionId) continue;
+      if (filter.turnId && record.turnId !== filter.turnId) continue;
+      records.push(this.inspection(record));
+    }
+    return records;
+  }
+
+  /**
+   * Human reconciliation for a provider response whose acceptance is unknown.
+   * `delivered` advances past the uncertain step; `not-delivered` makes that
+   * same step eligible for retry. Both preserve all earlier checkpoints.
+   */
+  async resolveUnknownStep(
+    key: TurnSendLedgerKey,
+    outcome: 'delivered' | 'not-delivered',
+  ): Promise<TurnSendLedgerInspection> {
+    if (outcome !== 'delivered' && outcome !== 'not-delivered') {
+      throw new Error('Unknown turn-send recovery outcome');
+    }
+    if (!existsSync(this.path(key))) throw new Error('Turn-send ledger record not found');
+    return withFileLock(this.path(key), async () => {
+      const record = this.read(key);
+      const sequence = record?.nonIdempotentSequence;
+      if (!record || record.final || sequence?.inFlightStep === undefined) {
+        throw new Error('Turn-send ledger has no unknown in-flight step to resolve');
+      }
+      if (outcome === 'delivered') sequence.completedSteps = sequence.inFlightStep + 1;
+      delete sequence.inFlightStep;
+      this.write(key, record);
+      return this.inspection(record);
+    }, { maxWaitMs: 60_000 });
+  }
+
+  /** Delete only safely completed records after the retention horizon. */
+  async pruneCompleted(nowMs = Date.now()): Promise<{ removed: number; retained: number }> {
+    if (!existsSync(this.directory)) return { removed: 0, retained: 0 };
+    const directoryStat = lstatSync(this.directory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error('Unsafe turn-send ledger directory');
+    }
+    if (!Number.isFinite(nowMs)) throw new Error('Invalid turn-send ledger prune time');
+    const cutoffMs = nowMs - TURN_SEND_LEDGER_COMPLETED_RETENTION_MS;
+    let removed = 0;
+    let retained = 0;
+    for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9]{32}\.json$/.test(name))) {
+      const path = join(this.directory, file);
+      try {
+        await withFileLock(path, async () => {
+          if (!existsSync(path)) return;
+          const record = this.readPath(path);
+          if (record.final && record.final.deliveredAtMs <= cutoffMs) {
+            unlinkSync(path);
+            removed++;
+          } else {
+            retained++;
+          }
+        }, { maxWaitMs: 0 });
+      } catch (error) {
+        if (!(error instanceof FileLockTimeoutError)) throw error;
+        // A live send owns this record. Retain it and let a later sweep retry;
+        // maintenance must never wait behind the delivery correctness path.
+        retained++;
+      }
+    }
+    return { removed, retained };
+  }
+
+  /**
+   * Cheap startup/send-path trigger around the full prune. The marker check is
+   * repeated under one directory-scoped lock so concurrent short-lived CLI
+   * processes cannot all scan the ledger at once.
+   */
+  async pruneCompletedIfDue(nowMs = Date.now()): Promise<{
+    ran: boolean;
+    removed: number;
+    retained: number;
+  }> {
+    if (!Number.isFinite(nowMs)) throw new Error('Invalid turn-send ledger prune time');
+    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    if (lstatSync(this.directory).isSymbolicLink()) throw new Error('Unsafe turn-send ledger directory');
+    const markerPath = join(this.directory, TURN_SEND_LEDGER_PRUNE_MARKER);
+    const readLastRun = (): number | undefined => {
+      if (!existsSync(markerPath)) return undefined;
+      const stat = lstatSync(markerPath);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Unsafe turn-send ledger prune marker');
+      const parsed = JSON.parse(readFileSync(markerPath, 'utf8')) as { lastRunMs?: unknown };
+      return typeof parsed.lastRunMs === 'number' && Number.isFinite(parsed.lastRunMs)
+        ? parsed.lastRunMs
+        : undefined;
+    };
+    const due = (lastRunMs: number | undefined): boolean =>
+      lastRunMs === undefined || nowMs - lastRunMs >= TURN_SEND_LEDGER_PRUNE_INTERVAL_MS;
+    if (!due(readLastRun())) return { ran: false, removed: 0, retained: 0 };
+    try {
+      return await withFileLock(markerPath, async () => {
+        if (!due(readLastRun())) return { ran: false, removed: 0, retained: 0 };
+        const result = await this.pruneCompleted(nowMs);
+        atomicWriteFileSync(markerPath, JSON.stringify({ lastRunMs: nowMs }), {
+          mode: 0o600,
+          followTargetSymlink: false,
+          durable: true,
+        });
+        return { ran: true, ...result };
+      }, { maxWaitMs: 0 });
+    } catch (error) {
+      if (error instanceof FileLockTimeoutError) {
+        return { ran: false, removed: 0, retained: 0 };
+      }
+      throw error;
+    }
   }
 
   /**

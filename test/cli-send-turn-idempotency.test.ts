@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,6 +77,25 @@ describe('botmux send per-turn final idempotency', () => {
       const auxiliary = f.run('auxiliary', 'supplement');
       expect(auxiliary.result.status, String(auxiliary.result.stderr)).toBe(0);
       expect(auxiliary.requests).toHaveLength(1);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('opportunistically prunes completed records older than 30 days without touching the send', () => {
+    const f = createFixture();
+    try {
+      expect(f.run('final', 'answer').result.status).toBe(0);
+      const recordPath = join(f.dataDir, 'turn-send-ledger', readdirLedger(f.dataDir));
+      const record = JSON.parse(readFileSync(recordPath, 'utf8'));
+      record.final.deliveredAtMs = Date.now() - 31 * 24 * 60 * 60_000;
+      writeFileSync(recordPath, JSON.stringify(record));
+      // The first send legitimately wrote today's throttle marker. Removing it
+      // simulates the next due maintenance window without waiting 24 hours.
+      rmSync(join(f.dataDir, 'turn-send-ledger', '.completed-prune'), { force: true });
+
+      const auxiliary = f.run('auxiliary', 'supplement');
+      expect(auxiliary.result.status, String(auxiliary.result.stderr)).toBe(0);
+      expect(auxiliary.requests).toHaveLength(1);
+      expect(existsSync(recordPath)).toBe(false);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 });
