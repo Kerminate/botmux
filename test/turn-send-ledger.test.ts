@@ -36,9 +36,9 @@ describe('TurnSendLedger', () => {
       const dispatch = vi.fn(async () => 'om_late');
 
       await expect(ledger.execute(key, 'final', 'changed answer', dispatch))
-        .rejects.toThrow('different final answer');
+        .rejects.toThrow('目标、提及或附件与已投递请求不同');
       await expect(ledger.execute(key, 'progress', 'late progress', dispatch))
-        .rejects.toThrow('finished; progress was not delivered');
+        .rejects.toThrow('本轮 final 已完成');
       expect(dispatch).not.toHaveBeenCalled();
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
@@ -130,20 +130,76 @@ describe('TurnSendLedger', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
     try {
       const ledger = new TurnSendLedger(dataDir);
-      const firstAttempt = vi.fn(async (index: number) => {
+      const firstAttempt = vi.fn(async (index: number, effects: {
+        providerRequestStarted(): void;
+      }) => {
+        effects.providerRequestStarted();
         if (index === 1) throw new Error('provider response lost');
       });
 
       await expect(ledger.executeNonIdempotentSequence(
-        key, 'final', 'long answer', 3, firstAttempt, 'doc:comment-1',
+        key, 'final', 'long answer', 3, firstAttempt as never, 'doc:comment-1',
       )).rejects.toThrow('provider response lost');
       expect(firstAttempt.mock.calls.map(call => call[0])).toEqual([0, 1]);
 
       const retry = vi.fn(async () => {});
       await expect(ledger.executeNonIdempotentSequence(
         { ...key, dispatchAttempt: 2 }, 'final', 'long answer', 3, retry, 'doc:comment-1',
-      )).rejects.toThrow('delivery of step 2 is unknown');
+      )).rejects.toThrow('第 2 个投递分块的结果未知');
       expect(retry).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows retry when a non-idempotent step fails before reaching the provider', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
+    try {
+      const ledger = new TurnSendLedger(dataDir);
+      await expect(ledger.executeNonIdempotentSequence(
+        key, 'final', 'answer', 1, async () => {
+          throw new Error('missing token before request');
+        }, 'doc:comment-1',
+      )).rejects.toThrow('missing token before request');
+
+      const retry = vi.fn(async (_index: number, effects?: {
+        providerRequestStarted(): void;
+      }) => {
+        effects?.providerRequestStarted();
+      });
+      await expect(ledger.executeNonIdempotentSequence(
+        key, 'final', 'answer', 1, retry as never, 'doc:comment-1',
+      )).resolves.toEqual({ messageId: 'doc:comment-1', replayed: false });
+      expect(retry).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows retry when the provider definitively rejects a non-idempotent step', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
+    try {
+      const ledger = new TurnSendLedger(dataDir);
+      await expect(ledger.executeNonIdempotentSequence(
+        key, 'final', 'answer', 1, async (_index: number, effects?: {
+          providerRequestStarted(): void;
+          providerRequestNotDelivered(): void;
+        }) => {
+          effects?.providerRequestStarted();
+          effects?.providerRequestNotDelivered();
+          throw new Error('provider rejected request');
+        }, 'doc:comment-1',
+      )).rejects.toThrow('provider rejected request');
+
+      const retry = vi.fn(async (_index: number, effects?: {
+        providerRequestStarted(): void;
+      }) => {
+        effects?.providerRequestStarted();
+      });
+      await expect(ledger.executeNonIdempotentSequence(
+        key, 'final', 'answer', 1, retry as never, 'doc:comment-1',
+      )).resolves.toEqual({ messageId: 'doc:comment-1', replayed: false });
+      expect(retry).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -175,7 +231,8 @@ describe('TurnSendLedger', () => {
     try {
       const ledger = new TurnSendLedger(dataDir);
       await expect(ledger.executeNonIdempotentSequence(
-        key, 'final', 'long answer', 3, async index => {
+        key, 'final', 'long answer', 3, async (index, effects) => {
+          effects.providerRequestStarted();
           if (index === 1) throw new Error('provider response lost');
         }, 'doc:comment-1',
       )).rejects.toThrow('provider response lost');
@@ -200,7 +257,8 @@ describe('TurnSendLedger', () => {
     try {
       const ledger = new TurnSendLedger(dataDir);
       await expect(ledger.executeNonIdempotentSequence(
-        key, 'final', 'long answer', 3, async index => {
+        key, 'final', 'long answer', 3, async (index, effects) => {
+          effects.providerRequestStarted();
           if (index === 1) throw new Error('provider response lost');
         }, 'doc:comment-1',
       )).rejects.toThrow('provider response lost');
@@ -224,7 +282,8 @@ describe('TurnSendLedger', () => {
     try {
       const ledger = new TurnSendLedger(dataDir);
       await expect(ledger.executeNonIdempotentSequence(
-        key, 'final', 'long answer', 3, async index => {
+        key, 'final', 'long answer', 3, async (index, effects) => {
+          effects.providerRequestStarted();
           if (index === 1) throw new Error('provider response lost');
         }, 'doc:comment-1',
       )).rejects.toThrow('provider response lost');
@@ -248,7 +307,8 @@ describe('TurnSendLedger', () => {
     try {
       const ledger = new TurnSendLedger(dataDir);
       await expect(ledger.executeNonIdempotentSequence(
-        key, 'final', 'short answer', 1, async () => {
+        key, 'final', 'short answer', 1, async (_index, effects) => {
+          effects.providerRequestStarted();
           throw new Error('provider response lost');
         }, 'doc:comment-1',
       )).rejects.toThrow('provider response lost');
@@ -275,7 +335,8 @@ describe('TurnSendLedger', () => {
       const stuckKey = { ...key, turnId: 'turn_stuck' };
       await ledger.execute(completedKey, 'final', 'done', async () => 'om_done');
       await expect(ledger.executeNonIdempotentSequence(
-        stuckKey, 'final', 'long answer', 2, async () => {
+        stuckKey, 'final', 'long answer', 2, async (_index, effects) => {
+          effects.providerRequestStarted();
           throw new Error('provider response lost');
         }, 'doc:comment-stuck',
       )).rejects.toThrow('provider response lost');

@@ -40,6 +40,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
+import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
@@ -178,7 +179,7 @@ import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.j
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
-import { TurnSendLedger } from './services/turn-send-ledger.js';
+import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
@@ -8220,6 +8221,15 @@ async function inspectFileOnlyAttachment(
   };
 }
 
+function sendAttachmentIdentity(path: string): {
+  path: string;
+  size: number;
+  mtimeMs: number;
+} {
+  const stat = statSync(path);
+  return { path: resolve(path), size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
 // decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
 // can be unit-tested with an explicit platform argument.
 
@@ -9308,7 +9318,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  const effectiveResponseKind = responseKind ?? 'progress';
+  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
   const expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
@@ -9690,6 +9700,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
   if (isOriginDocCommentTurn) {
+    // A document-comment turn has exactly one authoritative answer. Preserve an
+    // explicit kind for validation, but make the ordinary unclassified send the
+    // natural final operation for this sink.
+    if (responseKind === undefined) effectiveResponseKind = 'final';
     if (replyLayout) {
       console.error('botmux send: --layout 不作用于文档评论回复，本次已忽略');
       replyLayout = undefined;
@@ -9813,6 +9827,15 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Keep memory attribution in the model's rollout, but never render the
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
+  // File-only final inspection happens before the common validation block below
+  // so validate every attachment here. This preserves the established Chinese
+  // error instead of leaking createReadStream's raw ENOENT stack.
+  for (const path of [...images, ...files, ...videos, ...videoCovers]) {
+    if (!existsSync(path)) { console.error(`文件不存在: ${path}`); process.exit(1); }
+  }
+  for (const path of [...videos, ...videoCovers]) {
+    if (!statSync(path).isFile()) { console.error(`不是普通文件: ${path}`); process.exit(1); }
+  }
   // Validate the exact presentation text before any TTS, upload, contact
   // lookup, or message-provider effect. A sandbox relay may provide a
   // host-private prepared Markdown copy, so use the same precedence as the
@@ -9914,8 +9937,80 @@ async function cmdSend(rest: string[]): Promise<void> {
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
   const turnSendKey = currentTurnId
-    ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt }
+    ? {
+        larkAppId: originSession?.larkAppId ?? appId,
+        sessionId: originSessionId ?? sid,
+        turnId: currentTurnId,
+        dispatchAttempt: originDispatchAttempt,
+      }
     : undefined;
+  const turnRequestIdentity = canonicalJson({
+    version: 1,
+    content: expectedLinkRenderedContent,
+    destination: isOriginDocCommentTurn
+      ? {
+          mode: 'doc-comment',
+          larkAppId: originSession?.larkAppId,
+          fileToken: docTarget?.fileToken,
+          fileType: docTarget?.fileType,
+          commentId: docTarget?.commentId,
+        }
+      : {
+          mode: 'lark-im',
+          larkAppId: appId,
+          sessionId: sid,
+          chatId: overrideChatId ?? s.chatId,
+          sessionRootMessageId: s.rootMessageId,
+          sessionScope: s.scope,
+          topLevel: sendTopLevel,
+          into: sendInto,
+          explicitQuote,
+          noQuote,
+          quoteTargetId: explicitQuote
+            ?? frozenTurnDispatch?.quoteTargetId
+            ?? s.quoteTargetId,
+          frozenReplyTarget: frozenTurnReplyTarget,
+          turnReplyTarget: turnReplyTarget
+            ? {
+                rootMessageId: turnReplyTarget.rootMessageId,
+                turnId: turnReplyTarget.turnId,
+                quoteOnly: turnReplyTarget.quoteOnly,
+              }
+            : undefined,
+        },
+    addressing: {
+      mentions: mentionArgs,
+      mentionBack,
+      noMention,
+      replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+        ?? frozenTurnDispatch?.replyTargetSenderOpenId
+        ?? turnReplyTarget?.senderOpenId
+        ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
+    },
+    presentation: {
+      voice: asVoice,
+      slash: isSlashSend,
+      layout: replyLayout,
+      imageMode,
+      customCard,
+      as: asChoice,
+    },
+    controls: {
+      attention: attention.requested ? attention.kind : undefined,
+      urgent: urgent.requested ? urgent.mode : undefined,
+    },
+    attachments: {
+      images: images.map(sendAttachmentIdentity),
+      files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
+        ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
+        : files.map(sendAttachmentIdentity),
+      videos: videoAttachments.map(({ videoPath, coverPath, durationMs }) => ({
+        video: sendAttachmentIdentity(videoPath),
+        cover: sendAttachmentIdentity(coverPath),
+        durationMs,
+      })),
+    },
+  });
   const turnSendLedger = new TurnSendLedger(dataDir);
   try {
     await turnSendLedger.pruneCompletedIfDue();
@@ -9933,7 +10028,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
-      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, expectedLinkRenderedContent)
+      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
       : undefined;
   } catch (error) {
     console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
@@ -10008,7 +10103,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
-      const voiceDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+      const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
           beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
@@ -10181,16 +10276,20 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
             effectiveResponseKind,
-            expectedLinkRenderedContent,
+            turnRequestIdentity,
             chunks.length,
-            async i => {
+            async (i, effects) => {
               await replyToDocComment(
                 appId,
                 { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
                 exactDocTarget.commentId,
                 chunks[i],
                 i === 0 ? docMentionOpenId : undefined,
-                { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+                {
+                  beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+                  providerRequestStarted: effects.providerRequestStarted,
+                  providerRequestNotDelivered: effects.providerRequestNotDelivered,
+                },
               );
             },
             docMessageId,
@@ -10464,14 +10563,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (mentionBack && replyTargetSenderOpenId
       && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
-  }
-
-  // Validate file paths
-  for (const p of [...images, ...files, ...videos, ...videoCovers]) {
-    if (!existsSync(p)) { console.error(`文件不存在: ${p}`); process.exit(1); }
-  }
-  for (const p of [...videos, ...videoCovers]) {
-    if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
@@ -10841,7 +10932,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     uuid?: string,
   ): Promise<string> => {
     const result = await executeTurnPrimary(
-      expectedLinkRenderedContent,
+      turnRequestIdentity,
       providerUuid => dispatchPrimaryUnlocked(
         primaryContent,
         msgType,
@@ -11111,7 +11202,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // The single attachment IS the primary message. Keep upload + send under
       // the turn ledger lock so a concurrent final cannot upload or post a
       // duplicate, and never emit an empty interactive card first.
-      const fileDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+      const fileDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const fileKey = await uploadFile(appId, files[0]);
         return dispatchPrimaryUnlocked(
@@ -11297,7 +11388,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
-        const replyDelivery = await executeTurnPrimary(expectedLinkRenderedContent, async providerUuid => {
+        const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
                 ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }

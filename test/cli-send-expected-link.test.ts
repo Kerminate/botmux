@@ -224,7 +224,39 @@ describe('botmux send --expected-link', () => {
       writeFileSync(attachment, 'different attachment');
       const changed = run();
       expect(changed.status).toBe(2);
-      expect(String(changed.stderr)).toContain('different final answer');
+      expect(String(changed.stderr)).toContain('目标、提及或附件与已投递请求不同');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 40_000);
+
+  it('reports a missing file-only final with the existing Chinese attachment error', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-file-missing-friendly-'));
+    const dataDir = join(root, 'data');
+    const sessionId = 'sid_file_missing_friendly';
+    const turnId = 'turn_file_missing_friendly';
+    const attachment = join(root, 'missing.zip');
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId, turnId }));
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
+      sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+    } });
+    try {
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'final', '--files', attachment,
+      ], {
+        cwd: repo,
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId,
+          BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: 'cli_test' },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status).toBe(1);
+      expect(String(result.stderr)).toContain(`文件不存在: ${attachment}`);
+      expect(String(result.stderr)).not.toContain('ENOENT');
+      expect(String(result.stderr)).not.toContain('node:fs');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

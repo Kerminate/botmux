@@ -19,7 +19,8 @@ const key = {
 async function seedUnknownStep(dataDir: string): Promise<TurnSendLedger> {
   const ledger = new TurnSendLedger(dataDir);
   await expect(ledger.executeNonIdempotentSequence(
-    key, 'final', 'long answer', 3, async index => {
+    key, 'final', 'long answer', 3, async (index, effects) => {
+      effects.providerRequestStarted();
       if (index === 1) throw new Error('provider response lost');
     }, 'doc:comment-1',
   )).rejects.toThrow('provider response lost');
@@ -91,7 +92,8 @@ describe('turn-send-ledger operator command', () => {
       await seedUnknownStep(dataDir);
       const other = new TurnSendLedger(dataDir);
       await expect(other.executeNonIdempotentSequence(
-        { ...key, larkAppId: 'cli_other' }, 'final', 'answer', 2, async () => {
+        { ...key, larkAppId: 'cli_other' }, 'final', 'answer', 2, async (_index, effects) => {
+          effects.providerRequestStarted();
           throw new Error('provider response lost');
         }, 'doc:comment-2',
       )).rejects.toThrow('provider response lost');

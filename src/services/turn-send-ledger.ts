@@ -34,6 +34,13 @@ export interface TurnSendLedgerResult {
   replayed: boolean;
 }
 
+export interface NonIdempotentStepEffects {
+  /** Persist the unknown-delivery checkpoint immediately before a provider request. */
+  providerRequestStarted(): void;
+  /** Clear that checkpoint only after a provider response proves rejection. */
+  providerRequestNotDelivered(): void;
+}
+
 export type TurnSendLedgerInspection = Pick<TurnSendLedgerKey, 'larkAppId' | 'sessionId' | 'turnId'> & (
   | {
       state: 'completed';
@@ -58,8 +65,9 @@ const TURN_SEND_LEDGER_PRUNE_MARKER = '.completed-prune';
  * Cross-process final-answer fence for every primary `botmux send` path.
  *
  * Reply-card state remains responsible for card rendering and PATCH reuse. This
- * ledger is deliberately payload/route agnostic: once a turn has published a
- * final answer, no other primary route or recipient can mint a second one.
+ * The caller supplies a canonical identity covering payload, route, mentions,
+ * and attachments. Once a turn has published a final answer, no other primary
+ * route or recipient can mint a second one.
  */
 export class TurnSendLedger {
   readonly directory: string;
@@ -304,10 +312,10 @@ export class TurnSendLedger {
       const final = this.read(key)?.final;
       if (!final || kind === 'auxiliary') return undefined;
       if (kind === 'progress') {
-        throw new Error('This turn has finished; progress was not delivered');
+        throw new Error('本轮 final 已完成，不能再发送 progress；如需补充消息，请使用 --response-kind auxiliary');
       }
       if (final.fingerprint !== this.fingerprint(renderedContent)) {
-        throw new Error('This turn already delivered a different final answer');
+        throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
       }
       return { messageId: final.messageId, replayed: true };
     }, { maxWaitMs: 60_000 });
@@ -325,15 +333,17 @@ export class TurnSendLedger {
       const record = this.read(key) ?? { ...key, version: 1 as const };
       if (!record.final && record.nonIdempotentSequence) {
         const step = record.nonIdempotentSequence.inFlightStep;
-        if (step !== undefined) throw new Error(`delivery of step ${step + 1} is unknown`);
-        throw new Error('This turn has an incomplete non-idempotent delivery sequence');
+        if (step !== undefined) {
+          throw new Error(`第 ${step + 1} 个投递分块的结果未知；请先运行 botmux turn-send-ledger inspect，再核对并使用 resolve 恢复`);
+        }
+        throw new Error('本轮存在未完成的分块投递；请重试原 final 请求，或运行 botmux turn-send-ledger inspect 查看状态');
       }
       if (record.final && kind !== 'auxiliary') {
         if (kind === 'progress') {
-          throw new Error('This turn has finished; progress was not delivered');
+          throw new Error('本轮 final 已完成，不能再发送 progress；如需补充消息，请使用 --response-kind auxiliary');
         }
         if (record.final.fingerprint !== this.fingerprint(renderedContent)) {
-          throw new Error('This turn already delivered a different final answer');
+          throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
         }
         return { messageId: record.final.messageId, replayed: true };
       }
@@ -367,10 +377,10 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     stepCount: number,
-    dispatchStep: (index: number) => Promise<void>,
+    dispatchStep: (index: number, effects: NonIdempotentStepEffects) => Promise<void>,
     messageId: string,
   ): Promise<TurnSendLedgerResult> {
-    if (kind !== 'final') throw new Error('Non-idempotent delivery sequences require a final response');
+    if (kind !== 'final') throw new Error('分块投递只允许 final 回复；请使用 --response-kind final');
     if (!Number.isSafeInteger(stepCount) || stepCount <= 0) throw new Error('Non-idempotent delivery sequence must contain at least one step');
     if (!messageId) throw new Error('Missing non-idempotent delivery message ID');
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -380,7 +390,7 @@ export class TurnSendLedger {
       const fingerprint = this.fingerprint(renderedContent);
       if (record.final) {
         if (record.final.fingerprint !== fingerprint) {
-          throw new Error('This turn already delivered a different final answer');
+          throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
         }
         return { messageId: record.final.messageId, replayed: true };
       }
@@ -394,17 +404,36 @@ export class TurnSendLedger {
       if (sequence.fingerprint !== fingerprint
         || sequence.target !== messageId
         || sequence.stepCount !== stepCount) {
-        throw new Error('This turn already started a different non-idempotent delivery sequence');
+        throw new Error('本轮已开始另一组文档评论分块；请勿更换正文、目标或分块方式。先运行 botmux turn-send-ledger inspect 查看状态');
       }
       record.nonIdempotentSequence = sequence;
       if (sequence.inFlightStep !== undefined) {
-        throw new Error(`delivery of step ${sequence.inFlightStep + 1} is unknown`);
+        throw new Error(`第 ${sequence.inFlightStep + 1} 个投递分块的结果未知；请先运行 botmux turn-send-ledger inspect，再核对并使用 resolve 恢复`);
       }
 
       for (let index = sequence.completedSteps; index < stepCount; index++) {
-        sequence.inFlightStep = index;
-        this.write(key, record);
-        await dispatchStep(index);
+        let providerRequestInFlight = false;
+        const effects: NonIdempotentStepEffects = {
+          providerRequestStarted: () => {
+            if (providerRequestInFlight) {
+              throw new Error(`第 ${index + 1} 个投递分块已有 provider 请求进行中`);
+            }
+            sequence.inFlightStep = index;
+            providerRequestInFlight = true;
+            this.write(key, record);
+          },
+          providerRequestNotDelivered: () => {
+            if (!providerRequestInFlight || sequence.inFlightStep !== index) return;
+            delete sequence.inFlightStep;
+            providerRequestInFlight = false;
+            this.write(key, record);
+          },
+        };
+        await dispatchStep(index, effects);
+        // Legacy/internal callbacks that return successfully without the newer
+        // lifecycle signal are still safe to complete: a returned dispatch has
+        // a known outcome. The document-comment caller always signals before its
+        // actual POST so crashes retain the durable unknown checkpoint.
         sequence.completedSteps = index + 1;
         delete sequence.inFlightStep;
         this.write(key, record);
