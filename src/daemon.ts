@@ -1,3 +1,5 @@
+import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
+import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
@@ -311,12 +313,15 @@ import {
 } from './core/daemon-ipc-session-auth.js';
 import {
   authorizeReportSessionRelayRequest,
+  prepareAutomaticDispatchReport,
+  retryAutomaticDispatchReport,
   deliverReportSessionRelay,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
 } from './core/report-session-relay.js';
 import {
   createDispatchReportBinding,
+  resolveVerifiedDispatchReportTarget,
   dispatchReportBindingSecretPath,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
@@ -634,7 +639,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
-import { parseAskBody } from './core/ask-api.js';
+import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -3873,6 +3878,46 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // pre-turn guess, so the chat notice stays absent.
 }
 
+async function reportZeroPromptFinal(ds: DaemonSession, input: {
+  turnId: string; content: string; dispatchRoot?: string;
+}): Promise<void> {
+  if (!input.dispatchRoot) return;
+  let registry: Record<string, unknown>;
+  try { registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')); }
+  catch { return; }
+  const decision = prepareAutomaticDispatchReport({
+    registry, bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    dispatchRoot: input.dispatchRoot, sourceSessionId: ds.session.sessionId,
+    sourceLarkAppId: ds.larkAppId, content: input.content,
+  });
+  if (!decision) return;
+  const requestId = `zero-prompt:${ds.session.sessionId}:${input.turnId}`;
+  const triggerMeta = { requestId, receivedAt: new Date().toISOString(), turnIdempotencyKey: requestId };
+  await retryAutomaticDispatchReport(async () => {
+    const target = findOnlineDaemon(decision.target.larkAppId);
+    if (!target) throw new Error('zero-prompt report: orchestrator daemon is offline');
+    const delivered = await deliverReportSessionRelay({
+      decision, triggerMeta,
+      fetchTarget: (path, init) => fetchDaemonIpc(target.ipcPort, path, init),
+      postProjectUpdate: async () => ({ projectSynced: false }),
+    });
+    if (delivered.status >= 400 || delivered.body.ok === false) {
+      throw new Error(`zero-prompt report: ${delivered.body.error ?? delivered.status}`);
+    }
+  });
+}
+
+/** Only an authenticated dispatch can shed the protocol appended by our CLI. */
+function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?: string, frozen?: PromptInjection): string {
+  if (!zeroPromptInjectionForBot(larkAppId, undefined, frozen) || !dispatchRoot) return content;
+  try {
+    const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
+    const bound = resolveVerifiedDispatchReportTarget({ registry, dispatchRoot,
+      secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)) });
+    return bound.ok ? stripDispatchCompletionProtocol(content, dispatchRoot) : content;
+  } catch { return content; }
+}
+
 async function sessionReply(
   anchor: string,
   content: string,
@@ -4185,10 +4230,15 @@ async function notifyQuotaExhausted(
   limit: number | undefined,
 ): Promise<void> {
   if (typeof limit !== 'number') return;
+  let autoReapply = false;
+  try {
+    const cfg = getBot(larkAppId).config;
+    autoReapply = cfg.grantRequestToOwnerDm === true && cfg.autoGrantRequestCards !== false;
+  } catch { /* bot 不在 registry：沿用默认文案 */ }
   try {
     await sessionReply(
       anchor,
-      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId)),
+      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId), autoReapply),
       'interactive',
       larkAppId,
     );
@@ -7008,7 +7058,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskBroker({
+  const result = await registerAskForResponse({
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7026,7 +7076,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  });
+  }, res);
+  if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
@@ -17575,7 +17626,7 @@ async function resolveSoloSessionForTurn(
   let solo = false;
   try {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    if (effectiveReplyDelivery(ds.larkAppId, cliId) === 'transcript') {
+    if (effectiveReplyDelivery(ds.larkAppId, cliId, sessionPromptInjection(ds)) === 'transcript') {
       let chatMode: 'group' | 'topic' | undefined;
       let stats: { userCount: number; botCount: number } | undefined;
       if (chatType === 'group') {
@@ -17642,6 +17693,7 @@ function buildReservedInitialInput(
         ? undefined
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
       sessionBackendType: ds.session.backendType,
+      promptInjection: sessionPromptInjection(ds),
       // transcript + solo（resolveSoloSessionForTurn 在注册会话后算好）：首轮去壳。
       solo: ds.soloSession,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -17788,6 +17840,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
         whiteboardId: ds.session.whiteboardId,
         codexAppText: rawCodexText || buffered.join('\n\n'),
         sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
         turnId,
         solo: ds.soloSession,
         selfMention: { name: bot.botName, openId: bot.botOpenId },
@@ -17988,6 +18041,68 @@ function settlePrincipalLaneDispatchUnknown(
   }
 }
 
+const PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS = 100;
+const PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS = 5_000;
+
+function clearPrincipalLaneDispatchRetry(ds: DaemonSession, turnId?: string): void {
+  const retry = ds.principalLaneDispatchRetry;
+  if (!retry || (turnId !== undefined && retry.turnId !== turnId)) return;
+  if (retry.timer) clearTimeout(retry.timer);
+  ds.principalLaneDispatchRetry = undefined;
+}
+
+/** Keep one rejected pre-IPC FIFO head live without relying on a later inbound
+ * event. The runtime/session/head checks make a stale timer a no-op after close,
+ * route replacement, or queue advancement; delay growth is capped so a
+ * transient quarantine can recover without creating a tight retry loop. */
+function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): void {
+  let retry = ds.principalLaneDispatchRetry;
+  if (retry?.turnId !== turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+    retry = { turnId, attempt: 0 };
+    ds.principalLaneDispatchRetry = retry;
+  }
+  if (retry.timer) return;
+
+  const delay = Math.min(
+    PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS,
+    PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS * (2 ** Math.min(retry.attempt, 6)),
+  );
+  retry.attempt += 1;
+  const timer = setTimeout(() => {
+    if (ds.principalLaneDispatchRetry !== retry || retry.timer !== timer) return;
+    retry.timer = undefined;
+    const head = ds.session.principalLaneQueuedTurns?.[0];
+    if (ds.session.status !== 'active'
+        || activeSessions.get(activeSessionKey(ds)) !== ds
+        || !ds.session.principalLane
+        || ds.principalLaneRunningTurn
+        || ds.activeInteractiveTurn
+        || !head
+        || head.turnId !== turnId
+        || head.dispatchState !== 'queued') {
+      clearPrincipalLaneDispatchRetry(ds, turnId);
+      return;
+    }
+    try {
+      driveNextPrincipalLaneTurn(ds);
+    } catch (error) {
+      logger.error(
+        `[${tag(ds)}] Principal-lane queued turn retry failed `
+        + `turn=${turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const currentHead = ds.session.principalLaneQueuedTurns?.[0];
+      if (currentHead?.turnId === turnId && currentHead.dispatchState === 'queued') {
+        schedulePrincipalLaneDispatchRetry(ds, turnId);
+      } else {
+        clearPrincipalLaneDispatchRetry(ds, turnId);
+      }
+    }
+  }, delay);
+  timer.unref?.();
+  retry.timer = timer;
+}
+
 /** Dispatch only the durable FIFO head.  The `attempting` write happens before
  * worker IPC, so a commit-unknown/restart can never replay a turn that may have
  * reached the CLI.  The head remains present until its exact terminal edge. */
@@ -17996,7 +18111,13 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       || ds.principalLaneRunningTurn
       || ds.activeInteractiveTurn) return false;
   const head = ds.session.principalLaneQueuedTurns?.[0];
-  if (!head || head.dispatchState === 'attempting') return false;
+  if (!head || head.dispatchState === 'attempting') {
+    clearPrincipalLaneDispatchRetry(ds);
+    return false;
+  }
+  if (ds.principalLaneDispatchRetry?.turnId !== head.turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+  }
 
   head.dispatchState = 'attempting';
   sessionStore.updateSession(ds.session);
@@ -18043,6 +18164,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
         `[${tag(ds)}] Principal-lane queued turn was not dispatched; retained for retry `
         + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      schedulePrincipalLaneDispatchRetry(ds, head.turnId);
       return false;
     }
     // Once the IPC boundary was crossed the outcome is unknowable. Keep the
@@ -18051,6 +18173,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       `[${tag(ds)}] Principal-lane queued turn dispatch became unknown `
       + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
     );
+    clearPrincipalLaneDispatchRetry(ds, head.turnId);
     settlePrincipalLaneDispatchUnknown(ds, head.turnId, undefined);
     return false;
   }
@@ -18061,9 +18184,11 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
     }
     durableHead.dispatchState = 'queued';
     sessionStore.updateSession(ds.session);
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
     return false;
   }
 
+  clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
   setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
   rememberLastCliInput(ds, head.userPrompt, head.cliInput);
@@ -19745,6 +19870,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     chatId: ds.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     turnId,
   });
   cliInput.trustedCaller = { ...record.owner };
@@ -19914,6 +20040,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.wrapperCli = source.wrapperCli;
   child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
+  child.promptInjection = source.promptInjection ?? 'default';
 }
 
 function independentChildById(sessionId: string | undefined): DaemonSession | undefined {
@@ -22023,7 +22150,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // text; `content` may instead be the generated workflow prompt on legacy
   // paths. Keep those two lanes separate below. A coalesced forward already
   // carries its own context, so do not prepend a quote hint for the follow-up.
-  const codexAppQuoteContext = ctx.forwardSeedData
+  const codexAppQuoteContext = ctx.forwardSeedData || zeroPromptInjectionForBot(larkAppId)
     ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
@@ -22034,13 +22161,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 下载所有历史附件+长话题只取最旧 50 条且把 50 当精确总数的问题）。gate 已证明
   // 这是话题回复，无需再发网络探测。coalesced forward 已自带上下文不注入。仅首轮
   // — 后续 handleThreadReply 回合 CLI 已在首轮拿到该 hint，不重复注入。
-  const topicThreadContext = (parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
+  const topicThreadContext = (!zeroPromptInjectionForBot(larkAppId) && parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
     ? buildTopicThreadContext(localeForBot(larkAppId))
     : '';
   // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
   // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
   const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
-  const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
+  const promptContent = zeroPromptInjectionForBot(larkAppId)
+    ? zeroPromptTaskContent(content, larkAppId, parsed.rootId ?? parsed.messageId)
+    : topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
@@ -22654,6 +22783,7 @@ async function handleBotAdded(
   const bot = getBot(larkAppId);
   const botCfg = bot.config;
   const forced = typeof opts?.forcePrompt === 'string';
+  if (!forced && botCfg.autoStartExcludedChats?.includes(chatId)) return;
   if (!forced && botCfg.autoStartOnGroupJoin !== true) {
     logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
     return;
@@ -23583,17 +23713,22 @@ async function handleThreadReplyAdmitted(
   }
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
-  const botSenderPrefix = isForeignBot
+  const inputSession = activeSessions.get(runtimeSessionKey);
+  const zeroInjection = zeroPromptInjectionForBot(larkAppId, undefined,
+    inputSession ? sessionPromptInjection(inputSession) : undefined);
+  const botSenderPrefix = isForeignBot && !zeroInjection
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
-  const initialCodexAppMessageContext = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
+  const initialCodexAppMessageContext = zeroInjection ? ''
+    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const initialPromptContent = initialCodexAppMessageContext
-    + initialCodexAppApplicationContext
-    + stripCrossPrincipalAsToken(parsed.content).text;
+  const initialPromptContent = zeroInjection
+    ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
+    : initialCodexAppMessageContext + initialCodexAppApplicationContext
+      + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
   if (!prepared) {
@@ -24382,6 +24517,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
+          promptInjection: sessionPromptInjection(ds),
           turnId: parsed.messageId,
         });
         // R5-B1-1: freeze the admission-time steer authorization onto this earliest
@@ -24426,12 +24562,11 @@ async function handleThreadReplyAdmitted(
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
-    const attachmentHint = attachments.length > 0 ? formatAttachmentsHint(attachments) : '';
-    let enriched = attachmentHint
-      ? `${promptContent}${attachmentHint}`
-      : promptContent;
+    const attachmentHint = !zeroInjection && attachments.length > 0 ? formatAttachmentsHint(attachments) : '';
+    let enriched = zeroInjection ? buildZeroPromptInput(promptContent, attachments)
+      : attachmentHint ? `${promptContent}${attachmentHint}` : promptContent;
     if (attachmentHint) codexAppFollowUpContextParts.push(attachmentHint);
-    if (parsed.mentions && parsed.mentions.length > 0) {
+    if (!zeroInjection && parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
         return `- @${m.name}${idPart}`;
@@ -24457,7 +24592,7 @@ async function handleThreadReplyAdmitted(
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
-    if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
+    if (!zeroInjection && followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
       // the adjacent note a cursor session sees an inline ou_xxx:name with no
@@ -24523,6 +24658,7 @@ async function handleThreadReplyAdmitted(
           selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
@@ -24987,6 +25123,7 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             sessionBackendType: ds.session.backendType,
+            promptInjection: sessionPromptInjection(ds),
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
           },
@@ -25008,6 +25145,7 @@ async function handleThreadReplyAdmitted(
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         });
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -25191,6 +25329,7 @@ async function handleThreadReplyAdmitted(
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
+            promptInjection: sessionPromptInjection(ds),
             turnId: parsed.messageId,
           });
           // R4-B1: freeze the admission-time steer authorization onto the queued
@@ -25344,6 +25483,7 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           sessionBackendType: ds.session.backendType,
+          promptInjection: sessionPromptInjection(ds),
         },
       );
     } else {
@@ -27025,9 +27165,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
+    onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,

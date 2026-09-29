@@ -31,6 +31,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
@@ -1562,6 +1563,9 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
+   * Existing prompt and skill customizations remain saved. */
+  promptInjection?: 'default' | 'none';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -1613,6 +1617,14 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
+   * Per-bot CLI credential source directory (absolute, `~/` expanded). When set,
+   * a sandboxed bot copies its CLI login from `<dir>/<cli>/…` on every cold
+   * spawn instead of the machine's shared login, and refuses to start if that
+   * source is unusable. No effect on non-sandboxed bots. See
+   * services/cli-credential-source.ts.
+   */
+  credentialsSourceDir?: string;
   codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
@@ -1885,6 +1897,15 @@ export interface BotConfig {
    */
   autoGrantRequestCards?: boolean;
   /**
+   * 申请卡转投 owner 私聊。默认关闭（undefined = off），只有显式 true 才开：
+   * - 会话里没有任何管理员可点卡时（群里查不到管理员），申请卡改发到主 owner 私聊，
+   *   而不是回复在一个 owner 看不到的群里；
+   * - 私聊（p2p）被 talk 闸挡住时不再静默丢弃，同样把申请卡发到主 owner 私聊。
+   * 两种情况申请人都只收到一句不含 owner 身份的中性回执；私聊投递另受 owner 维度总量节流。
+   * 前提是 autoGrantRequestCards 未关闭。适合关掉 autoInviteOwnerOnGroupAdd、owner 不进群的用法。
+   */
+  grantRequestToOwnerDm?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -1994,6 +2015,8 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
   */
   cotEnabled?: boolean;
+  /** Legacy tool-output preference; false still suppresses result bodies. */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -2126,6 +2149,8 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
+  autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
   globalMessageListener?: MessageListenerConfig;
   /** Per-chat exceptions to {@link globalMessageListener}; an absent entry inherits. */
@@ -3306,6 +3331,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.cliLaunchMode,
       `Bot config [${i}].cliLaunchMode`,
     );
+    let credentialsSourceDir: string | undefined;
+    try {
+      credentialsSourceDir = normalizeCredentialsSourceDir(entry.credentialsSourceDir);
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
+    if (credentialsSourceDir && entry.codexAuthSync === 'isolated') {
+      throw new Error(`Bot config [${i}]: credentialsSourceDir cannot be combined with codexAuthSync "isolated"`);
+    }
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
@@ -3717,11 +3751,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      credentialsSourceDir,
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
@@ -3795,6 +3831,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // 默认关，只落显式 true。
+      grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
@@ -3821,6 +3859,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
@@ -3875,6 +3914,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
         ? entry.groupJoinCommand.trim()

@@ -2,6 +2,7 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
+import { sessionPromptInjection, supportsZeroPromptInjection, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
@@ -207,7 +208,8 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   };
 }
 
-function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string): string | undefined {
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string, promptInjection: PromptInjection): string | undefined {
+  if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
@@ -1660,7 +1662,7 @@ export async function handleCotCommand(
       if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
         const update = ds.lastThinkingUpdate;
         await updateTurnReplyCard(ds, update.turnId, {
-          kind: 'tools', tools: publicReplyCardTools(update.entries, true),
+          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
@@ -1818,7 +1820,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
         }
-        const securityError = cliSelectionSecurityError(botCfg, selectedCliId);
+        const securityError = cliSelectionSecurityError(botCfg, selectedCliId, sessionPromptInjection(ds));
         if (securityError) {
           await sessionReply(rootId, `CLI selection rejected: ${securityError}`);
           break;
@@ -3734,8 +3736,8 @@ export async function handleCommand(
         // `/login --scope a b c` —— 在默认 scope 之外追加申请。
         //
         // 飞书被拒时会返回结构化的 missing_scopes（99991679），所以「缺什么补什么」
-        // 不需要猜：把它报的名字原样传进来即可。默认集只覆盖只读，写操作和通讯录
-        // 这类走这条路显式申请——让人在授权页上看见自己批准的到底是什么。
+        // 不需要猜：把它报的名字原样传进来即可。默认集只覆盖消息/资源和续期，
+        // 文档、通讯录和写操作等权限走这条路显式申请——让人在授权页上看见自己批准的到底是什么。
         //
         // 名字对着 lark-scopes.json 校验：拼错不会降级，会让整个授权链接 20043 失败，
         // 那时用户看到的是一个打不开的链接，而不是「这个 scope 不认识」。
