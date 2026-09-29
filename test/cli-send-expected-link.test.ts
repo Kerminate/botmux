@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { constants as bufferConstants } from 'node:buffer';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -162,6 +163,36 @@ describe('botmux send --expected-link', () => {
       expect(JSON.parse(requests[0].body.content)).toEqual({ file_key: 'file_test_upload' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+
+  it('does not decode a file-only attachment when neither expected-link nor turn fencing needs inspection', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-file-no-prescan-'));
+    const dataDir = join(root, 'data');
+    const sessionId = 'sid_file_no_prescan';
+    const attachment = join(root, 'large.bin');
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(attachment, '');
+    truncateSync(attachment, bufferConstants.MAX_STRING_LENGTH + 1);
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
+      sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+    } });
+    try {
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'auxiliary', '--files', attachment,
+      ], {
+        cwd: repo,
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId,
+          BOTMUX_LARK_APP_ID: 'cli_test', BOTMUX_TURN_ID: '',
+          BOTMUX_TEST_STUB_LARGE_FILE_UPLOAD: attachment },
+        encoding: 'utf8', timeout: 60_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 70_000);
 
   it('rejects a different file-only final for the same turn even without expected-link', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-file-final-fingerprint-'));

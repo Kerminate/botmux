@@ -630,6 +630,49 @@ describe('cmdSend hook context wiring', () => {
     expect(docSend.indexOf('removeCommentReaction(')).toBeGreaterThan(docSend.indexOf('executeNonIdempotentSequence('));
   });
 
+  it('rejects a non-final document-comment reply with actionable guidance before provider effects', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-doc-comment-final-only-'));
+    const dataDir = join(root, 'data');
+    const sessionId = 'sid_doc_comment_final_only';
+    const turnId = 'turn_doc_comment_final_only';
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+      sessionId, turnId,
+    }));
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
+      sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'doc:doc_test', rootMessageId: 'om_root', scope: 'thread', workingDir: root,
+      docCommentTargets: { [turnId]: {
+        fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test', turnId,
+      } },
+    } });
+    try {
+      const result = await runCli(
+        ['send', '--no-mention', 'interim comment'],
+        {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: sessionId,
+          BOTMUX_LARK_APP_ID: 'cli_test',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_WORKFLOW: '',
+        },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('文档评论轮只允许一条 final 回复，请使用 --response-kind final');
+      expect(result.stderr).not.toContain('Non-idempotent delivery sequences require a final response');
+      expect(result.stderr).not.toContain('Unexpected test');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
     // 2+ distinct counterparts OR an incomplete window → block --mention-back and
     // hand the model explicit --mention candidates. Reads the persisted

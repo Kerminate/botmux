@@ -1,4 +1,22 @@
 import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+
+// The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
+// never decodes it as UTF-8. Keep the later upload path lightweight: production
+// uploadFile still asks fs for bytes, but this fixture only needs to exercise
+// routing and captures the resulting file message rather than uploading 512MiB.
+const stubbedLargeUpload = process.env.BOTMUX_TEST_STUB_LARGE_FILE_UPLOAD;
+if (stubbedLargeUpload) {
+  const originalReadFileSync = fs.readFileSync.bind(fs);
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options?: unknown) => {
+    if (String(path) === stubbedLargeUpload && options === undefined) {
+      return Buffer.from('fixture-upload');
+    }
+    return originalReadFileSync(path, options as never);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+}
 
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');

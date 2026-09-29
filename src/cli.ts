@@ -29,7 +29,7 @@
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readSchedulePromptUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
@@ -39,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
@@ -8184,6 +8185,38 @@ function extractCardText(content: string): string {
   }
 }
 
+async function inspectFileOnlyAttachment(
+  path: string,
+  expectedLinks: readonly string[],
+  computeSha256: boolean,
+): Promise<{ missingExpectedLinks: string[]; sha256?: string }> {
+  const remainingLinks = new Set(expectedLinks);
+  const hash = computeSha256 ? createHash('sha256') : undefined;
+  const decoder = remainingLinks.size > 0 ? new StringDecoder('utf8') : undefined;
+  const overlapLength = Math.max(0, ...expectedLinks.map(link => link.length - 1));
+  let overlap = '';
+  const inspectDecodedText = (decoded: string): void => {
+    const window = overlap + decoded;
+    for (const expectedLink of remainingLinks) {
+      if (window.includes(expectedLink)) remainingLinks.delete(expectedLink);
+    }
+    overlap = overlapLength > 0 ? window.slice(-overlapLength) : '';
+  };
+
+  for await (const chunk of createReadStream(path)) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    hash?.update(bytes);
+    if (decoder && remainingLinks.size > 0) inspectDecodedText(decoder.write(bytes));
+    if (!hash && remainingLinks.size === 0) break;
+  }
+  if (decoder && remainingLinks.size > 0) inspectDecodedText(decoder.end());
+
+  return {
+    missingExpectedLinks: expectedLinks.filter(link => remainingLinks.has(link)),
+    ...(hash ? { sha256: hash.digest('hex') } : {}),
+  };
+}
+
 // decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
 // can be unit-tested with an explicit platform argument.
 
@@ -9662,6 +9695,10 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
       process.exit(2);
     }
+    if (effectiveResponseKind !== 'final') {
+      console.error('botmux send: 文档评论轮只允许一条 final 回复，请使用 --response-kind final');
+      process.exit(2);
+    }
     if (sid !== originSessionId
       || sendTopLevel
       || !!overrideChatId
@@ -9796,21 +9833,32 @@ async function cmdSend(rest: string[]): Promise<void> {
     && mentionArgs.length === 0
     && !mentionBack;
   // A file-only final intentionally has no card body. Its attachment is the
-  // user-visible primary content, so expected-link validation and the turn
-  // fingerprint must cover the exact bytes that will be uploaded. Read before
-  // any provider effect; an unreadable attachment therefore fails cleanly.
-  const linkValidationContent = fileOnlyPrimaryRequested
-    ? readFileSync(files[0], 'utf8')
-    : expectedLinkRenderedContent;
-  for (const expectedLink of expectedLinks) {
-    if (!linkValidationContent.includes(expectedLink)) {
-      console.error(`botmux send: expected link missing from rendered content: ${expectedLink}`);
-      process.exit(2);
-    }
-  }
+  // user-visible primary content, so inspect it only when link validation or a
+  // durable final-answer fingerprint needs the bytes. The bounded streaming
+  // pass avoids materializing either a full UTF-8 string or a second Buffer.
   if (fileOnlyPrimaryRequested) {
-    const attachmentBytes = readFileSync(files[0]);
-    expectedLinkRenderedContent = `file-only:sha256:${createHash('sha256').update(attachmentBytes).digest('hex')}`;
+    const needsTurnFingerprint = !!currentTurnId && effectiveResponseKind === 'final';
+    if (expectedLinks.length > 0 || needsTurnFingerprint) {
+      const inspection = await inspectFileOnlyAttachment(
+        files[0],
+        expectedLinks,
+        needsTurnFingerprint,
+      );
+      if (inspection.missingExpectedLinks.length > 0) {
+        console.error(`botmux send: expected link missing from rendered content: ${inspection.missingExpectedLinks[0]}`);
+        process.exit(2);
+      }
+      if (inspection.sha256) {
+        expectedLinkRenderedContent = `file-only:sha256:${inspection.sha256}`;
+      }
+    }
+  } else {
+    for (const expectedLink of expectedLinks) {
+      if (!expectedLinkRenderedContent.includes(expectedLink)) {
+        console.error(`botmux send: expected link missing from rendered content: ${expectedLink}`);
+        process.exit(2);
+      }
+    }
   }
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
   if (asChoice) {
