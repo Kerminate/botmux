@@ -28,7 +28,7 @@ describe('extractHttpUrlSpans', () => {
   });
 
   it('does not normalize duplicate parameters, empty values, encoding, or fragments', () => {
-    const source = 'https://example.test/p#A%20B';
+    const source = 'https://example.test/p' + '?b=2&a=1&a=&encoded=%2F&unicode=%E4%B8%AD#A%20B';
     expect(extractHttpUrlSpans(source)).toEqual([{ start: 0, end: source.length, originalUrl: source }]);
   });
 });

@@ -45,11 +45,11 @@ describe('LinkRefLedger', () => {
     ledger.openTurn(key);
     const base = 'https://example.test/p';
     const urls = [
-      `${base}?b=2&a=1&a=`,
-      `${base}?a=1&a=&b=2`,
-      `${base}?a=%2F`,
-      `${base}?a=/`,
-      `${base}?a=1&a=1`,
+      base + '?b=2&a=1&a=',
+      base + '?a=1&a=&b=2',
+      base + '?a=%2F',
+      base + '?a=/',
+      base + '?a=1&a=1',
       `${base}#one`,
     ];
     const registered = ledger.registerBatch(key, urls.map(candidate)).registered;
