@@ -145,7 +145,17 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     children.push(child);
     child.stdout?.on('data', chunk => logs.push(String(chunk)));
     child.stderr?.on('data', chunk => logs.push(String(chunk)));
-    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'link_ref_restore_mode') {
+        child.send({
+          type: 'link_ref_restore_mode_result',
+          requestId: message.requestId,
+          mode: 'enabled',
+        } satisfies DaemonToWorker);
+      }
+    });
 
     child.send({
       type: 'init',
@@ -223,6 +233,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         type: 'final_output',
         turnId: 'om_turn_survived',
         content: 'TAKEOVER_OK',
+        linkRefMode: 'enabled',
       }),
       expect.objectContaining({
         type: 'turn_terminal',
@@ -230,6 +241,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         status: 'completed',
       }),
     ]));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'link_ref_restore_mode',
+      sessionId: 'sid-remote-takeover',
+      turnId: 'om_turn_survived',
+    }));
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 

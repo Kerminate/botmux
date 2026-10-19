@@ -14554,6 +14554,35 @@ function setupWorkerHandlers(
         } satisfies DaemonToWorker);
         break;
       }
+      case 'link_ref_restore_mode': {
+        let mode: 'enabled' | undefined;
+        let error: string | undefined;
+        if (!ownsWorkerSession()
+          || msg.sessionId !== ds.session.sessionId
+          || !msg.turnId) {
+          error = 'link_ref_identity_mismatch';
+        } else {
+          try {
+            mode = getLinkRefRuntime()?.restoreMode({
+              appId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined
+                ? { dispatchAttempt: msg.dispatchAttempt }
+                : {}),
+            });
+          } catch {
+            error = 'link_ref_ledger_unavailable';
+          }
+        }
+        if (worker.connected) worker.send({
+          type: 'link_ref_restore_mode_result',
+          requestId: msg.requestId,
+          ...(mode ? { mode } : {}),
+          ...(error ? { error } : {}),
+        } satisfies DaemonToWorker);
+        break;
+      }
       case 'active_turn_envelope_changed':
         inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
         break;

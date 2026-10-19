@@ -16,7 +16,14 @@ export interface BackendTurnInput {
   turnId: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: RemoteRunnerTrustedCaller;
+}
+
+/** Host-owned state frozen beside a Remote Runner turn. Providers never send
+ * or receive this context; it exists only on the backend → worker callbacks. */
+export interface RemoteRunnerTurnHostContext {
+  linkRefMode?: 'observe' | 'enabled';
 }
 
 export interface BackendTurnSubmission {
@@ -225,14 +232,21 @@ export interface SessionBackend {
    * a backend must not pre-filter it. Optional — backends whose output the user
    * can already read in a terminal never implement it.
    */
-  onTurnFinal?(cb: (text: string, turnId?: string) => void): void;
+  onTurnFinal?(cb: (
+    text: string,
+    turnId?: string,
+    hostContext?: RemoteRunnerTurnHostContext,
+  ) => void): void;
   /** Exact provider-reported terminal failure for a submitted turn. */
   onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
   /** Provider-requested, non-terminal chat output for the active turn. The
    * worker remains the trusted routing and delivery authority; providers never
    * receive a destination override or platform credential. */
   onOutboundMessage?(
-    cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
+    cb: (
+      message: RemoteRunnerOutboundMessage,
+      hostContext: RemoteRunnerTurnHostContext,
+    ) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void;
   /** Provider-requested, read-only access to the current BotMux session's
    * allowlisted helper surface.  The worker freezes session and turn authority
@@ -243,6 +257,12 @@ export interface SessionBackend {
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */
   onTurnRecovered?(cb: (turn: RemoteRunnerRecoveredTurn) => void): void;
+  /** Install daemon-restored host-only state for an exact provider-owned turn.
+   * Until this succeeds, the backend must not release recovered output. */
+  setRecoveredTurnHostContext?(
+    turnId: string,
+    context: RemoteRunnerTurnHostContext,
+  ): boolean;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
   /** Durable, provider-neutral lineage/runtime state changed. */

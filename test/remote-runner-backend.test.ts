@@ -448,6 +448,7 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-survived',
       dispatchAttempt: 4,
     });
+    expect(backend.setRecoveredTurnHostContext('turn-survived', {})).toBe(true);
     expect(progress.join('')).toContain('recovered progress');
     await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
       .resolves.toMatchObject({ submitted: false });

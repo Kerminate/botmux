@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { CliTurnPayload } from '../types.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { collectLinkRefCandidates } from './link-ref-extractor.js';
@@ -130,6 +132,8 @@ export function createLinkRefRuntime(
       return resolveOutboundLinkRefs(ledger(), key, payload);
     },
     restoreMode(key) {
+      if (!openedLedger && !deps.ledger
+        && !existsSync(join(dataDir, 'link-refs', 'link-refs.sqlite'))) return undefined;
       const row = ledger().readTurn(key);
       return row?.mode === 'enabled' && row.state === 'open' && row.expiresAtMs > Date.now()
         ? 'enabled'

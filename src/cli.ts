@@ -9802,6 +9802,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   let isolatedAttestationContext: ManagedOriginAttestationContext | undefined;
   let isolatedManagedOriginCtx: ManagedOriginAttestation | undefined;
   const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';
+  const trustedRelayLinkRefMode = trustedHostRelay
+    && (process.env.BOTMUX_LINK_REF_TURN_MODE === 'observe'
+      || process.env.BOTMUX_LINK_REF_TURN_MODE === 'enabled')
+    ? process.env.BOTMUX_LINK_REF_TURN_MODE
+    : undefined;
   const trustedRelayAttemptRaw = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
   const trustedRelayCandidate = trustedHostRelay && process.env.BOTMUX_SESSION_ID
     ? {
@@ -10813,9 +10818,15 @@ async function cmdSend(rest: string[]): Promise<void> {
     catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
   }
   try {
-    const linkRefMode = liveMarkerCtx?.linkRefMode
-      ?? isolatedManagedOriginCtx?.linkRefMode
-      ?? ancestorCtx?.linkRefMode;
+    const trustedLinkRefModes = [
+      liveMarkerCtx?.linkRefMode,
+      isolatedManagedOriginCtx?.linkRefMode,
+      trustedRelayLinkRefMode,
+    ];
+    const linkRefMode = trustedLinkRefModes.includes('enabled')
+      ? 'enabled'
+      : trustedLinkRefModes.find((mode): mode is 'observe' => mode === 'observe')
+        ?? ancestorCtx?.linkRefMode;
     const resolved = await resolveLinkRefsThroughSessionHost({
       text: content,
       ...(preparedText === undefined ? {} : { preparedText }),

@@ -1677,7 +1677,12 @@ let sandboxRelayOutbox: string | null = null;
  *  leave its outbox for the successor worker to re-serve; only a real close /
  *  restart / a PTY-owned CLI tears it down. */
 let credentialOnlyRelayOutlivesWorker = false;
-let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
+let sandboxRelayCapability: {
+  token: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+} | null = null;
 let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
@@ -1695,6 +1700,30 @@ const pendingLinkRefResolutions = new Map<string, {
   resolve: (value: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs) => void;
   reject: (error: Error) => void;
 }>();
+const pendingLinkRefModeRestores = new Map<string, {
+  resolve: (mode: 'enabled' | undefined) => void;
+  reject: (error: Error) => void;
+}>();
+
+function restoreLinkRefModeThroughHost(input: {
+  turnId: string;
+  dispatchAttempt?: number;
+}): Promise<'enabled' | undefined> {
+  const requestId = randomUUID();
+  const result = new Promise<'enabled' | undefined>((resolve, reject) => {
+    pendingLinkRefModeRestores.set(requestId, { resolve, reject });
+  });
+  send({
+    type: 'link_ref_restore_mode',
+    requestId,
+    sessionId,
+    turnId: input.turnId,
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+  });
+  return result.finally(() => pendingLinkRefModeRestores.delete(requestId));
+}
 
 function assertBoundedLinkRefIpcValue(value: unknown, maxBytes: number): void {
   let serialized: string;
@@ -3863,6 +3892,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     ...(authorityDispatchAttempt !== undefined
       ? { dispatchAttempt: authorityDispatchAttempt }
       : {}),
+    ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
   };
   const files = [
     ...(sandboxRelayOutbox
@@ -4029,6 +4059,7 @@ function authorizeManagedSend(
     turnId?: string;
     dispatchAttempt?: number;
     requiresCodexAppLedger?: boolean;
+    linkRefMode?: 'observe' | 'enabled';
   };
 } | { ok: false; error: string } {
   if (!sessionId) return { ok: false, error: 'VC policy cannot resolve session id' };
@@ -4081,6 +4112,7 @@ function authorizeManagedSend(
             ? { dispatchAttempt: capability.dispatchAttempt }
             : {}),
           ...(requiresCodexAppLedger ? { requiresCodexAppLedger: true } : {}),
+          ...(capability.linkRefMode ? { linkRefMode: capability.linkRefMode } : {}),
         },
       }
     : { ok: false, error: `${decision.errorCode}: ${decision.error}` };
@@ -6151,7 +6183,11 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
-function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
+function deliverRemoteTurnFinal(
+  text: string,
+  exactTurnId?: string,
+  linkRefMode?: 'observe' | 'enabled',
+): void {
   if (!text.trim()) return;
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
@@ -6203,12 +6239,14 @@ function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
     lastUuid: turnId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
   });
   log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
 }
 
 async function deliverRemoteRunnerOutboundMessage(
   message: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessage,
+  linkRefMode?: 'observe' | 'enabled',
 ): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessageResult> {
   const authority = activeTurnAuthority.identity();
   if (!sessionId || !lastInitConfig
@@ -6245,6 +6283,7 @@ async function deliverRemoteRunnerOutboundMessage(
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
     env,
   });
 }
@@ -14834,6 +14873,7 @@ async function flushPending(): Promise<void> {
               turnId: item.turnId,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
               ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              ...(item.linkRefMode ? { linkRefMode: item.linkRefMode } : {}),
               ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
             });
           }
@@ -20802,7 +20842,7 @@ async function spawnCli(
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text, turnId) => {
+  backend.onTurnFinal?.((text, turnId, hostContext) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
     if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
@@ -20810,7 +20850,7 @@ async function spawnCli(
       return;
     }
     try {
-      deliverRemoteTurnFinal(text, turnId);
+      deliverRemoteTurnFinal(text, turnId, hostContext?.linkRefMode);
     } catch (err) {
       log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -20824,7 +20864,7 @@ async function spawnCli(
       );
     }
   });
-  backend.onOutboundMessage?.(async (message) => {
+  backend.onOutboundMessage?.(async (message, hostContext) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
       return {
         outcome: 'rejected',
@@ -20832,7 +20872,7 @@ async function spawnCli(
         message: 'The backend generation that requested this message is no longer active.',
       };
     }
-    return deliverRemoteRunnerOutboundMessage(message);
+    return deliverRemoteRunnerOutboundMessage(message, hostContext?.linkRefMode);
   });
   backend.onSessionTool?.(async (operation) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
@@ -20844,7 +20884,7 @@ async function spawnCli(
     }
     return deliverRemoteRunnerSessionTool(operation);
   });
-  backend.onTurnRecovered?.((turn) => {
+  backend.onTurnRecovered?.(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
@@ -20852,14 +20892,33 @@ async function spawnCli(
           `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
         );
       }
+      // Fence startup synchronously before awaiting the daemon. The backend
+      // resolves its ready handshake immediately after this callback returns;
+      // without this early mark, a queued successor could flush into the still
+      // provider-owned recovered turn while its host context is being restored.
       setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
+      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
+      remoteRunnerRecoveredTurnInFlight = true;
+      const restoredLinkRefMode = await restoreLinkRefModeThroughHost({
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined
+          ? { dispatchAttempt: turn.dispatchAttempt }
+          : {}),
+      });
+      if (fatalWorkerErrorPending || backend !== observedBackend) return;
+      if (!observedBackend.setRecoveredTurnHostContext?.(
+        turn.turnId,
+        restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {},
+      )) {
+        throw new Error('recovered turn host context is no longer installable');
+      }
+      currentBotmuxLinkRefMode = restoredLinkRefMode;
+      rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, restoredLinkRefMode);
       // Only receiver attempts participate in the durable HOL protocol. An
       // ordinary primary Lark turn has no dispatchAttempt; its recovered-turn
       // fence below still blocks startup readiness until the provider settles,
       // but must not arm a latch that only an attempt-bearing terminal can
       // release.
-      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
-      remoteRunnerRecoveredTurnInFlight = true;
       currentTurnSteerPromoted = false;
       markActiveTurnStarted({
         turnId: turn.turnId,
@@ -24101,6 +24160,14 @@ process.on('message', async (raw: unknown) => {
       pendingLinkRefResolutions.delete(msg.requestId);
       if (msg.ok && msg.payload) pending.resolve(msg.payload);
       else pending.reject(new Error(msg.error ?? 'link_ref_ledger_unavailable'));
+      break;
+    }
+    case 'link_ref_restore_mode_result': {
+      const pending = pendingLinkRefModeRestores.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefModeRestores.delete(msg.requestId);
+      if (msg.error) pending.reject(new Error(msg.error));
+      else pending.resolve(msg.mode === 'enabled' ? 'enabled' : undefined);
       break;
     }
     case 'plugin_result_delivery_result': {

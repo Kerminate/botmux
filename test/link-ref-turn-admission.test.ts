@@ -157,6 +157,21 @@ describe('LinkRef turn admission', () => {
     reopened.close();
   });
 
+  it('does not create a ledger while probing a disabled recovered turn', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-link-ref-disabled-recovery-'));
+    dirs.push(dataDir);
+    const runtime = createLinkRefRuntime(dataDir);
+
+    expect(runtime.restoreMode({
+      appId: 'app-disabled-recovery',
+      sessionId: 'session-disabled-recovery',
+      turnId: 'turn-disabled-recovery',
+    })).toBeUndefined();
+    expect(existsSync(join(dataDir, 'link-refs', 'link-refs.sqlite'))).toBe(false);
+
+    runtime.close();
+  });
+
   it('installs an inert daemon runtime and clears it on shutdown', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-link-ref-runtime-'));
     dirs.push(dataDir);

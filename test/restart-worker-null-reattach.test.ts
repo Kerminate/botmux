@@ -262,8 +262,8 @@ describe('P2 worker onTaskDone generation fence', () => {
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
-    const turnFinal = region.indexOf('backend.onTurnFinal?.((text, turnId)');
-    const turnRecovered = region.indexOf('backend.onTurnRecovered?.((turn)');
+    const turnFinal = region.indexOf('backend.onTurnFinal?.((text, turnId, hostContext)');
+    const turnRecovered = region.indexOf('backend.onTurnRecovered?.(async (turn)');
     const onExit = region.indexOf('backend.onExit((code, signal)');
     expect(agentStatus, 'onAgentStatus').toBeGreaterThanOrEqual(0);
     expect(taskDone, 'onTaskDone').toBeGreaterThanOrEqual(0);
