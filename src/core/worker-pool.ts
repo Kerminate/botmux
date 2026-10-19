@@ -17604,6 +17604,7 @@ function setupWorkerHandlers(
                 ...(msg.dispatchAttempt !== undefined
                   ? { dispatchAttempt: msg.dispatchAttempt }
                   : {}),
+                ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
               }),
             );
           } catch (err) {
@@ -17625,6 +17626,7 @@ function setupWorkerHandlers(
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
+          ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }

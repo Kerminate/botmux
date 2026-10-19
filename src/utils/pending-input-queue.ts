@@ -5,6 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
@@ -16,6 +17,8 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** Admission-frozen mode for the exact queued turn. */
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside
    *  the live-turn marker so the identity wrapper can keep a same-principal
    *  credential across consecutive turns. */

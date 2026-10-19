@@ -5769,7 +5769,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | 'link-refs/register',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5799,6 +5799,42 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+async function decorateSessionCliLinkRefResult<T extends object>(input: {
+  sessionId: string;
+  appId: string;
+  sourceType: 'history' | 'quoted';
+  sourceId?: string;
+  value: T;
+}): Promise<T | (T & { linkRefs: { companion: string } })> {
+  const context = findAncestorSessionContext();
+  const mode = context?.sessionId === input.sessionId
+    ? context.linkRefMode ?? 'disabled'
+    : 'disabled';
+  if (mode === 'disabled') return input.value;
+  const discovered = (() => {
+    try { return findDaemon(input.appId)?.ipcPort; } catch { return undefined; }
+  })();
+  const ipcPort = resolveDaemonIpcPort(discovered, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) return input.value;
+  const { decorateCliLinkRefResult } = await import('./core/link-ref-ipc.js');
+  return decorateCliLinkRefResult({
+    mode,
+    sourceType: input.sourceType,
+    ...(input.sourceId ? { sourceId: input.sourceId } : {}),
+    value: input.value,
+    register: async payload => {
+      const response = await postSessionCliIpc(
+        ipcPort,
+        input.sessionId,
+        'link-refs/register',
+        { ...payload },
+      );
+      if (!response.ok) throw new Error(`link_ref_registration_http_${response.status}`);
+      return response.json() as Promise<{ companion?: string }>;
+    },
+  });
 }
 
 async function cmdContinuation(argv: string[]): Promise<void> {
@@ -7145,7 +7181,12 @@ botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 
  * backgrounded/deeply-nested invocations). See resolveSessionContext for why
  * the env fallback is safe.
  */
-function findAncestorSessionContext(): { sessionId: string; turnId?: string; dispatchAttempt?: number } | null {
+function findAncestorSessionContext(): {
+  sessionId: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+} | null {
   const resolved = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
   if (!resolved) return null;
   const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
@@ -8547,7 +8588,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
         : effectiveScope === 'ambient'
           ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
           : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
-    console.log(JSON.stringify({
+    const historyResult = {
       sessionId: sid,
       chatId: s.chatId,
       scope: effectiveScope,
@@ -8568,7 +8609,15 @@ async function cmdHistory(rest: string[]): Promise<void> {
       ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
         hint: '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（任意消息 id 均可，附件会下载到本地）；需要原始卡片 JSON：botmux quoted <messageId> --raw 或本命令加 --with-card-json',
       } : {}),
-    }, null, 2));
+    };
+    const decorated = await decorateSessionCliLinkRefResult({
+      sessionId: sid,
+      appId,
+      sourceType: 'history',
+      sourceId: `${effectiveScope}:${messages.length}`,
+      value: historyResult,
+    });
+    console.log(JSON.stringify(decorated, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
     process.exit(1);
@@ -8602,7 +8651,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
   // isolated bot's `botmux quoted` failed "Bot not registered".
   await registerSelfFromCredFile();
-  const { larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
+  const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
   // Target-aware gate (see cmdHistory).
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
 
@@ -8652,7 +8701,14 @@ async function cmdQuoted(rest: string[]): Promise<void> {
       (rendered as { attachments?: unknown }).attachments = attachments;
       if (needLogin) (rendered as { needLogin?: boolean }).needLogin = true;
     }
-    console.log(JSON.stringify(rendered, null, 2));
+    const decorated = await decorateSessionCliLinkRefResult({
+      sessionId: sid,
+      appId,
+      sourceType: 'quoted',
+      sourceId: messageId,
+      value: rendered,
+    });
+    console.log(JSON.stringify(decorated, null, 2));
   } catch (err: any) {
     console.error(`获取被引用消息失败: ${err.message}`);
     process.exit(1);

@@ -754,6 +754,8 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
+    linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;

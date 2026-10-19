@@ -2206,7 +2206,7 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; linkRefMode?: 'observe' | 'enabled' }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn

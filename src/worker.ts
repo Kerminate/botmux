@@ -3463,6 +3463,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 undefined,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -3510,6 +3511,7 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentBotmuxLinkRefMode: 'observe' | 'enabled' | undefined;
 /** Open id of the human whose turn currentBotmuxTurnId belongs to. Published
  *  alongside the live-turn marker so the identity wrapper can keep a
  *  same-principal credential across consecutive turns. */
@@ -3549,6 +3551,7 @@ let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -3722,6 +3725,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   const activeIdentity = activeTurnAuthority.identity();
   const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
   const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  const authorityLinkRefMode = currentBotmuxLinkRefMode;
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(authorityTurnId ? { turnId: authorityTurnId } : {}),
@@ -3744,6 +3748,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
         }]
@@ -3766,6 +3771,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
         }]
@@ -3812,6 +3818,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(capability.dispatchAttempt !== undefined
         ? { dispatchAttempt: capability.dispatchAttempt }
         : {}),
+      ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
     });
   }
   return true;
@@ -3975,6 +3982,7 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
 function adoptInitialActiveTurn(parsed: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
@@ -3988,6 +3996,7 @@ function adoptInitialActiveTurn(parsed: {
     // continuation the marker itself already witnessed.
     parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
   );
+  currentBotmuxLinkRefMode = parsed.linkRefMode;
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
@@ -4007,6 +4016,7 @@ function adoptInitialActiveTurn(parsed: {
 function adoptDisplacedActiveTurn(parsed: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
@@ -4017,6 +4027,7 @@ function adoptDisplacedActiveTurn(parsed: {
   const displaced: QueuedTypeAheadTurnRecord = {
     turnId: currentBotmuxTurnId!,
     ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
     ...(currentCaller ? { trustedCaller: currentCaller } : {}),
     ...(currentController ? { trustedController: currentController } : {}),
     ...(currentVcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin: currentVcMeetingImTurnOrigin } : {}),
@@ -4029,6 +4040,7 @@ function adoptDisplacedActiveTurn(parsed: {
     typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
     parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
   );
+  currentBotmuxLinkRefMode = parsed.linkRefMode;
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   if (!queuedTypeAheadTurns.some(q => q.turnId === displaced.turnId)) {
     queuedTypeAheadTurns.unshift(displaced);
@@ -4118,6 +4130,9 @@ function writeCliPidMarker(): void {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+                    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+                      ? { linkRefMode: qt.linkRefMode }
+                      : {}),
                     ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                     ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
                     ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
@@ -4136,6 +4151,7 @@ function writeCliPidMarker(): void {
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+          ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
           ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
           ...(t.trustedController ? { trustedController: t.trustedController } : {}),
           ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
@@ -4147,6 +4163,7 @@ function writeCliPidMarker(): void {
           sessionId,
           turnId: currentBotmuxTurnId ?? null,
           dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+          ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
           ...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {}),
           ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
           ...(effectiveController ? { trustedController: effectiveController } : {}),
@@ -4181,6 +4198,9 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
+              ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
+                ? { linkRefMode: t.linkRefMode }
+                : {}),
               ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
               ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
               ...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {}),
@@ -4220,6 +4240,9 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
                 typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
                 parsed.callerOpenId ?? advancedRecord.turnCallerOpenId,
               );
+              currentBotmuxLinkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
+                ? parsed.linkRefMode
+                : advancedRecord.linkRefMode;
               currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
               currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
               queuedTypeAheadTurns.splice(0, idx + 1);
@@ -4247,6 +4270,9 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
+                ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+                  ? { linkRefMode: qt.linkRefMode }
+                  : {}),
                 ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                 ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                 ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
@@ -4270,6 +4296,7 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   const prevTurnId = currentBotmuxTurnId;
   markTurnRetired(prevTurnId);
   setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
+  currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
   queuedTurnAdvanceConsumedForPrompt = true;
@@ -10340,6 +10367,7 @@ async function writeAdoptMessage(
   content: string,
   turnId: string | undefined,
   dispatchAttempt?: number,
+  linkRefMode?: 'observe' | 'enabled',
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
@@ -10363,6 +10391,7 @@ async function writeAdoptMessage(
     markTurnRetired(currentBotmuxTurnId);
   }
   setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
+  currentBotmuxLinkRefMode = linkRefMode;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
   markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
@@ -10623,6 +10652,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.content,
       item.turnId,
       item.dispatchAttempt,
+      item.linkRefMode,
       item.vcMeetingImTurnOrigin,
       item.trustedCaller,
       item.trustedController,
@@ -14455,6 +14485,7 @@ async function flushPending(): Promise<void> {
             queuedTypeAheadTurns.push({
               turnId: item.turnId,
               dispatchAttempt: item.dispatchAttempt,
+              linkRefMode: item.linkRefMode,
               trustedCaller: item.trustedCaller,
               trustedController: item.trustedController,
               vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
@@ -14471,6 +14502,7 @@ async function flushPending(): Promise<void> {
             item.dispatchAttempt,
             item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
           );
+          currentBotmuxLinkRefMode = item.linkRefMode;
           currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
           currentTurnSteerPromoted = false;
           // Intentionally preserve queuedTypeAheadTurns: earlier type-ahead turns remain in queue.
@@ -15181,6 +15213,7 @@ function sendToPty(
     queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
+    linkRefMode?: 'observe' | 'enabled';
     codexAppDispatchId?: string;
     codexAppSteerable?: true;
     queuedActivationToken?: string;
@@ -15217,6 +15250,7 @@ function sendToPty(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -20920,6 +20954,7 @@ async function spawnCli(
     backend = null;
     isPromptReady = false;
     setCaptureIdentity(undefined, undefined);
+    currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
     queuedTurnAdvanceConsumedForPrompt = false;
     retiredTurnIds.clear();
@@ -21239,6 +21274,7 @@ function killCli(opts: {
   readIsolationOriginCapabilityFile = null;
   readIsolationOriginChannelId = null;
   setCaptureIdentity(undefined, undefined);
+  currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
   queuedTurnAdvanceConsumedForPrompt = false;
   retiredTurnIds.clear();
@@ -24038,6 +24074,7 @@ process.on('message', async (raw: unknown) => {
         // Initial capture-identity snapshot (sent even for an idle/restored
         // (undefined, undefined) tuple) before any frame can be captured.
         setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined, msg.turnCallerOpenId);
+        currentBotmuxLinkRefMode = msg.linkRefMode;
         if (msg.turnId) {
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           if (msg.prompt) {
@@ -24518,6 +24555,7 @@ process.on('message', async (raw: unknown) => {
           turnId: msg.turnId,
           replyTurnId: msg.replyTurnId,
           dispatchAttempt: msg.dispatchAttempt,
+          linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -24548,6 +24586,7 @@ process.on('message', async (raw: unknown) => {
           ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
+          linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
