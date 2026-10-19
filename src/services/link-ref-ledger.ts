@@ -363,9 +363,19 @@ export class LinkRefLedger {
   }
 
   deleteSession(appId: string, sessionId: string): number {
-    return this.transaction(() => Number(this.db.prepare(`
-      DELETE FROM link_ref_turns WHERE app_id = ? AND session_id = ?
-    `).run(appId, sessionId).changes));
+    return this.transaction(() => {
+      // Bun SQLite includes rows removed by ON DELETE CASCADE in `changes`,
+      // while node:sqlite reports only the rows deleted from this table. Count
+      // the public unit (turns) explicitly so the API is runtime-independent.
+      const row = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM link_ref_turns
+        WHERE app_id = ? AND session_id = ?
+      `).get(appId, sessionId) as { count: number };
+      this.db.prepare(`
+        DELETE FROM link_ref_turns WHERE app_id = ? AND session_id = ?
+      `).run(appId, sessionId);
+      return Number(row.count);
+    });
   }
 
   pruneExpired(nowMs: number = this.now()): { expired: number; removed: number } {
@@ -374,9 +384,15 @@ export class LinkRefLedger {
         UPDATE link_ref_turns SET state = 'expired', expires_at_ms = ?
         WHERE state = 'open' AND last_activity_at_ms + ? <= ?
       `).run(nowMs, LINK_REF_RETENTION_MS, nowMs).changes);
-      const removed = Number(this.db.prepare(`
+      // See deleteSession: count turns before the cascading delete instead of
+      // exposing the engine-specific meaning of `changes` to callers.
+      const removable = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM link_ref_turns WHERE expires_at_ms <= ?
+      `).get(nowMs) as { count: number };
+      this.db.prepare(`
         DELETE FROM link_ref_turns WHERE expires_at_ms <= ?
-      `).run(nowMs).changes);
+      `).run(nowMs);
+      const removed = Number(removable.count);
       return { expired, removed };
     });
   }

@@ -420,13 +420,18 @@ describe('LinkRef turn admission mode freeze', () => {
     bot.config.linkRefs = { mode: 'disabled' };
 
     expect(ds.session.queuedActivationTail?.[0]?.cliInput).toEqual(expect.objectContaining({
-      content: expect.stringContaining('<frozen-link-ref />'),
-      linkRefs: { mode: 'enabled' },
+      content: 'queued',
+      linkRefs: {
+        mode: 'enabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'queued source' }],
+      },
     }));
     expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect(prepareTurn).toHaveBeenCalledOnce();
     expect(ds.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
       turnId: 'om_link_ref_tail',
       linkRefMode: 'enabled',
+      content: expect.stringContaining('<frozen-link-ref />'),
     }));
   });
 

@@ -821,6 +821,7 @@ function prepareAdmittedLinkRefPayload(input: {
   payload: CliTurnPayload;
   turnId?: string;
   dispatchAttempt?: number;
+  frozenMode?: LinkRefMode;
 }): { payload: CliTurnPayload; mode: LinkRefMode } {
   const declaredMode = input.payload.linkRefs?.mode;
   // `sources` exist only before the real admission boundary, so their mode is
@@ -828,7 +829,7 @@ function prepareAdmittedLinkRefPayload(input: {
   // source-free envelope is already admitted (queued/recovered) and its typed
   // mode is copied verbatim even if live configuration changed meanwhile.
   const pendingMode = input.ds.pendingLinkRefMode;
-  const mode = pendingMode
+  const mode = input.frozenMode ?? pendingMode
     ?? (input.payload.linkRefs?.sources === undefined && declaredMode
     ? declaredMode
     : resolveEffectiveLinkRefMode({
@@ -861,6 +862,44 @@ function prepareAdmittedLinkRefPayload(input: {
     }),
     mode,
   };
+}
+
+function freezeDeferredLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  const mode = input.ds.pendingLinkRefMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+      ? declaredMode
+      : resolveEffectiveLinkRefMode({
+          env: process.env,
+          bot: getBot(input.ds.larkAppId).config.linkRefs,
+          global: readGlobalConfig().linkRefs,
+        }));
+  if (mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode };
+  }
+  return {
+    payload: {
+      ...input.payload,
+      linkRefs: {
+        mode,
+        ...(input.payload.linkRefs?.sources
+          ? { sources: input.payload.linkRefs.sources }
+          : {}),
+      },
+    },
+    mode,
+  };
+}
+
+function freezeAdmittedPayloadInPlace(target: CliTurnPayload, admitted: CliTurnPayload): CliTurnPayload {
+  if (target === admitted) return target;
+  for (const key of Object.keys(target) as Array<keyof CliTurnPayload>) delete target[key];
+  Object.assign(target, admitted);
+  return target;
 }
 
 /** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
@@ -11829,13 +11868,6 @@ export function sendWorkerInput(
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
     : undefined);
-  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
-    ds,
-    payload: normalized,
-    turnId: effectiveTurnId,
-    dispatchAttempt: opts.dispatchAttempt,
-  });
-  normalized = admittedLinkRefs.payload;
   const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
   const routingTurnId = turnId ?? replyTurnId;
   const replyContext = frozenReplyContextForTurn(ds, routingTurnId);
@@ -11906,8 +11938,19 @@ export function sendWorkerInput(
   }
 
   // Real delivery boundary: subtract background sources covered while this
-  // turn waited (FIFO / staged tail) and freeze what is actually sent.
+  // turn waited (FIFO / staged tail) and freeze what is actually sent. LinkRef
+  // admission must follow this rewrite so its companion/ledger describe only
+  // the group context that really crosses worker IPC.
   commitGroupContextDispatch(ds, normalized, effectiveTurnId);
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: normalized,
+    turnId: effectiveTurnId,
+    dispatchAttempt: opts.dispatchAttempt,
+  });
+  normalized = typeof payload === 'string'
+    ? admittedLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(payload, admittedLinkRefs.payload);
   const codexAppInput = codexAppInputForSession(
     ds,
     normalized.codexAppInput,
@@ -12272,11 +12315,11 @@ export function promoteQueuedActivationTail(
   // a true→false toggle between N+1 admission and N's ACK would otherwise
   // discard N+1's exact sidecar/hidden context. Only fill the deterministic id
   // for legacy entries persisted before admission began stamping it.
-  const codexAppInput = cloneFrozenCodexAppInput(
+  let codexAppInput = cloneFrozenCodexAppInput(
     head.cliInput.codexAppInput,
     head.turnId,
   );
-  const exactInput: CliTurnPayload = {
+  let exactInput: CliTurnPayload = {
     content: head.cliInput.content,
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
@@ -12288,6 +12331,23 @@ export function promoteQueuedActivationTail(
     ...(head.cliInput.trustedController ? { trustedController: head.cliInput.trustedController } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
+  // A queued successor can wait long enough for earlier native-input receipts
+  // to cover part of its frozen group background. Commit that exact dispatch
+  // first, then register LinkRefs using the mode frozen when the tail entry was
+  // admitted. This prevents stale, never-delivered group URLs entering the
+  // companion/ledger while keeping rollout changes from mutating queued work.
+  commitGroupContextDispatch(ds, exactInput, head.turnId);
+  const admittedLinkRefs = exactInput.linkRefs
+    ? prepareAdmittedLinkRefPayload({
+        ds,
+        payload: exactInput,
+        turnId: head.turnId,
+        dispatchAttempt: head.dispatchAttempt,
+        frozenMode: exactInput.linkRefs.mode,
+      })
+    : { payload: exactInput, mode: 'disabled' as const };
+  exactInput = freezeAdmittedPayloadInPlace(exactInput, admittedLinkRefs.payload);
+  codexAppInput = cloneFrozenCodexAppInput(exactInput.codexAppInput, head.turnId);
 
   ds.session.queued = false;
   ds.session.queuedActivationPending = true;
@@ -12323,8 +12383,8 @@ export function promoteQueuedActivationTail(
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
         ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
-        ...(exactInput.linkRefs?.mode && exactInput.linkRefs.mode !== 'disabled'
-          ? { linkRefMode: exactInput.linkRefs.mode }
+        ...(admittedLinkRefs.mode !== 'disabled'
+          ? { linkRefMode: admittedLinkRefs.mode }
           : {}),
       },
       head.turnId,
@@ -12354,8 +12414,8 @@ export function promoteQueuedActivationTail(
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
-      ...(exactInput.linkRefs?.mode && exactInput.linkRefs.mode !== 'disabled'
-        ? { linkRefMode: exactInput.linkRefs.mode }
+      ...(admittedLinkRefs.mode !== 'disabled'
+        ? { linkRefMode: admittedLinkRefs.mode }
         : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
@@ -12433,11 +12493,9 @@ export function admitQueuedActivationTail(
   opts: { codexAppInputGateFrozen?: boolean } = {},
 ): QueuedActivationTailEntry {
   const admittedLinkRefs = entry.cliInput.linkRefs
-    ? prepareAdmittedLinkRefPayload({
+    ? freezeDeferredLinkRefPayload({
         ds,
         payload: entry.cliInput,
-        turnId: entry.turnId,
-        dispatchAttempt: entry.dispatchAttempt,
       })
     : { payload: entry.cliInput, mode: 'disabled' as const };
   const frozenInput = admittedLinkRefs.payload;
@@ -13303,18 +13361,21 @@ export function forkWorker(
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
+  // A fork carries the opening/queued input straight into worker init. Freeze
+  // the exact group background after every defer/refusal seam, then admit
+  // LinkRefs from that final payload immediately before irreversible
+  // child-launch preparation.
+  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
   const admittedOpeningLinkRefs = prepareAdmittedLinkRefPayload({
     ds,
     payload: promptPayload,
     turnId: initAttributionTurnId,
     dispatchAttempt: initDispatchAttempt,
   });
-  promptPayload = admittedOpeningLinkRefs.payload;
+  promptPayload = typeof promptInput === 'string'
+    ? admittedOpeningLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
   prompt = promptPayload.content;
-  // A fork carries the opening/queued input straight into worker init. Freeze
-  // LinkRefs only after every defer/refusal seam and launch-config snapshot,
-  // immediately before irreversible child-launch preparation.
-  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -19912,11 +19973,20 @@ function commitGroupContextDispatch(ds: DaemonSession, payload: CliTurnPayload, 
   try {
     if (!hasPreparedGroupContext(ds.larkAppId, ds.chatId, turnId)) return;
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    commitGroupContextDispatchIntoPayload(payload, {
+    const committed = commitGroupContextDispatchIntoPayload(payload, {
       appId: ds.larkAppId, chatId: ds.chatId, turnId, sessionId: ds.session.sessionId,
       epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, turnId),
       ...(ds.session.workerGeneration !== undefined ? { workerGeneration: ds.session.workerGeneration } : {}),
     });
+    if (committed && payload.linkRefs?.sources) {
+      const sources = payload.linkRefs.sources.flatMap(source => {
+        if (source.sourceType !== 'group_context' || source.kind !== 'text') return [source];
+        return committed.dispatched.body
+          ? [{ ...source, text: committed.dispatched.body }]
+          : [];
+      });
+      payload.linkRefs = { ...payload.linkRefs, sources };
+    }
   } catch (error) {
     logger.warn(`[${tag(ds)}] group-context dispatch commit skipped: ${error instanceof Error ? error.message : String(error)}`);
   }
