@@ -8861,6 +8861,16 @@ export async function closeSession(
         closedForkP2pTopic.chatId,
       );
     }
+    if (closeAppId) {
+      try {
+        getLinkRefRuntime()?.deleteSession(closeAppId, sessionId);
+      } catch {
+        logger.warn(
+          `[${sessionId.slice(0, 8)}] LinkRef session cleanup failed `
+          + 'code=link_ref_ledger_unavailable',
+        );
+      }
+    }
     const closeStreamingOwner = ds ?? closeStoredOwner;
     if (closeAppId && closeStreamingOwner && closePinnedStreamingTargets.length > 0) {
       void unpinProvenStreamingCardTargets(closeAppId, closePinnedStreamingTargets);
@@ -17130,6 +17140,21 @@ function setupWorkerHandlers(
             `(worker=${msg.sessionId}, daemon=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
           );
           break;
+        }
+        try {
+          getLinkRefRuntime()?.settleTurn({
+            appId: ds.larkAppId,
+            sessionId: ds.session.sessionId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          });
+        } catch {
+          logger.warn(
+            `[${t}] LinkRef turn settlement failed `
+            + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+          );
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);

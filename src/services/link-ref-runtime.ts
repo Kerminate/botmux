@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CliTurnPayload } from '../types.js';
+import { logger } from '../utils/logger.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { collectLinkRefCandidates } from './link-ref-extractor.js';
 import { LinkRefLedger } from './link-ref-ledger.js';
@@ -58,12 +59,57 @@ export function createLinkRefRuntime(
   } = {},
 ): LinkRefRuntime {
   let openedLedger: LinkRefLedger | undefined;
+  let pruneTimer: NodeJS.Timeout | undefined;
+  const prune = (store: LinkRefLedger): void => {
+    try {
+      store.pruneExpired();
+    } catch {
+      logger.warn('[link-ref] maintenance failed code=link_ref_ledger_unavailable');
+    }
+  };
   const ledger = (): LinkRefLedger => {
-    openedLedger ??= deps.ledger?.() ?? new LinkRefLedger(dataDir);
+    if (!openedLedger) {
+      openedLedger = deps.ledger?.() ?? new LinkRefLedger(dataDir);
+      prune(openedLedger);
+      pruneTimer = setInterval(() => {
+        if (openedLedger) prune(openedLedger);
+      }, 24 * 60 * 60_000);
+      pruneTimer.unref?.();
+    }
     return openedLedger;
   };
   const recordDiagnostic = (event: LinkRefDiagnostic): void => {
-    deps.onDiagnostic?.(event);
+    const projected: LinkRefDiagnostic = {};
+    if (event.mode === 'disabled' || event.mode === 'observe' || event.mode === 'enabled') {
+      projected.mode = event.mode;
+    }
+    if (event.sourceType && [
+      'user_message', 'group_context', 'card', 'history', 'quoted', 'attachment',
+      'tool', 'mcp', 'public_system_doc',
+    ].includes(event.sourceType)) projected.sourceType = event.sourceType;
+    for (const key of [
+      'scannedBytes', 'found', 'registered', 'deduplicated', 'filtered', 'limited',
+      'refCount', 'durationMs',
+    ] as const) {
+      const value = event[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        projected[key] = value;
+      }
+    }
+    if (typeof event.refId === 'string' && /^lr_[0-9a-f]{32}$/.test(event.refId)) {
+      projected.refId = event.refId;
+    }
+    if (typeof event.urlHash === 'string' && /^[0-9a-f]{64}$/.test(event.urlHash)) {
+      projected.urlHash = event.urlHash;
+    }
+    if (typeof event.outcome === 'string' && /^[a-z0-9_:-]{1,128}$/.test(event.outcome)) {
+      projected.outcome = event.outcome;
+    }
+    if (typeof event.errorCode === 'string' && /^[a-z0-9_:-]{1,128}$/.test(event.errorCode)) {
+      projected.errorCode = event.errorCode;
+    }
+    if (deps.onDiagnostic) deps.onDiagnostic(projected);
+    else logger.info(`[link-ref] ${JSON.stringify(projected)}`);
   };
   const runtime: LinkRefRuntime = {
     prepareTurn({ key, mode, payload }) {
@@ -129,7 +175,27 @@ export function createLinkRefRuntime(
     },
     resolveForDaemon(key, mode, payload) {
       if (mode === 'disabled' || mode === 'observe') return { ...payload, refCount: 0 };
-      return resolveOutboundLinkRefs(ledger(), key, payload);
+      const startedAt = performance.now();
+      try {
+        const resolved = resolveOutboundLinkRefs(ledger(), key, payload);
+        recordDiagnostic({
+          mode,
+          outcome: 'resolved',
+          refCount: resolved.refCount,
+          durationMs: Math.max(0, performance.now() - startedAt),
+        });
+        return resolved;
+      } catch (error) {
+        recordDiagnostic({
+          mode,
+          outcome: 'resolution_failed',
+          errorCode: error && typeof error === 'object' && 'code' in error
+            ? String((error as { code: unknown }).code)
+            : 'link_ref_ledger_unavailable',
+          durationMs: Math.max(0, performance.now() - startedAt),
+        });
+        throw error;
+      }
     },
     restoreMode(key) {
       if (!openedLedger && !deps.ledger
@@ -155,7 +221,7 @@ export function createLinkRefRuntime(
         throw new LinkRefError('link_ref_ledger_unavailable');
       }
       try {
-        const resolved = resolveOutboundLinkRefs(store, key, { text: draft });
+        const resolved = runtime.resolveForDaemon(key, mode, { text: draft });
         return { content: resolved.text ?? draft, draftPending: true };
       } catch (error) {
         if (error instanceof LinkRefError) throw error;
@@ -176,6 +242,8 @@ export function createLinkRefRuntime(
     },
     recordDiagnostic,
     close() {
+      if (pruneTimer) clearInterval(pruneTimer);
+      pruneTimer = undefined;
       openedLedger?.close();
       openedLedger = undefined;
     },
