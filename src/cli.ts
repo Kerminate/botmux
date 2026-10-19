@@ -5769,7 +5769,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | 'link-refs/register',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5799,6 +5799,58 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+export async function resolveLinkRefsThroughSessionHost(
+  input: import('./services/link-ref-resolver.js').OutboundLinkRefPayload,
+  options: {
+    mode?: 'observe' | 'enabled';
+    sessionId?: string;
+    appId?: string;
+    ipcPort?: number;
+  } = {},
+): Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs> {
+  const context = findAncestorSessionContext();
+  const trustedMode = options.mode ?? context?.linkRefMode;
+  if (trustedMode !== 'enabled') return { ...input, refCount: 0 };
+  const {
+    expandOutboundLinkRefs,
+    findOutboundExecutableLinkRefs,
+  } = await import('./services/link-ref-resolver.js');
+  if (findOutboundExecutableLinkRefs(input).length === 0) {
+    return expandOutboundLinkRefs(input, new Map());
+  }
+  const sessionId = options.sessionId ?? context?.sessionId;
+  if (!sessionId) throw new Error('link_ref_identity_mismatch');
+  const discovered = (() => {
+    try { return findDaemon(options.appId ?? process.env.BOTMUX_LARK_APP_ID)?.ipcPort; }
+    catch { return undefined; }
+  })();
+  const ipcPort = resolveDaemonIpcPort(
+    options.ipcPort ?? discovered,
+    process.env.BOTMUX_DAEMON_IPC_PORT,
+  );
+  if (!ipcPort) throw new Error('link_ref_ledger_unavailable');
+  const response = await postSessionCliIpc(
+    ipcPort,
+    sessionId,
+    'link-refs/resolve',
+    { payload: input },
+  );
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs;
+  };
+  if (!response.ok || body.ok !== true || !body.payload) {
+    const error = response.status === 413
+      ? 'link_ref_limit_exceeded'
+      : body.error?.startsWith('link_ref_') || body.error === 'expected_link_invalid_after_link_ref'
+        ? body.error
+        : 'link_ref_ledger_unavailable';
+    throw new Error(error);
+  }
+  return body.payload;
 }
 
 async function decorateSessionCliLinkRefResult<T extends object>(input: {
@@ -10030,23 +10082,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
   let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
-  const expectedLinks = argValues(rest, '--expected-link');
+  let expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
       && (rest[index + 1] === undefined || rest[index + 1]!.startsWith('--'))))) {
     console.error('botmux send: --expected-link 需要 URL 参数');
     process.exit(2);
-  }
-  for (const expectedLink of expectedLinks) {
-    let url: URL;
-    try { url = new URL(expectedLink); } catch {
-      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
-      process.exit(2);
-    }
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
-      process.exit(2);
-    }
   }
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
@@ -10765,6 +10806,49 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Keep memory attribution in the model's rollout, but never render the
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
+  const expectedLinkPreparedFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  let preparedText: string | undefined;
+  if (!customCard && expectedLinkPreparedFile) {
+    try { preparedText = readFileSync(expectedLinkPreparedFile, 'utf-8'); }
+    catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
+  }
+  try {
+    const linkRefMode = liveMarkerCtx?.linkRefMode
+      ?? isolatedManagedOriginCtx?.linkRefMode
+      ?? ancestorCtx?.linkRefMode;
+    const resolved = await resolveLinkRefsThroughSessionHost({
+      text: content,
+      ...(preparedText === undefined ? {} : { preparedText }),
+      ...(customCard === undefined ? {} : { card: customCard }),
+      expectedLinks,
+    }, {
+      mode: linkRefMode,
+      sessionId: originSessionId ?? sid,
+      appId: originSession?.larkAppId ?? s.larkAppId,
+    });
+    content = resolved.text ?? content;
+    preparedText = resolved.preparedText ?? preparedText;
+    customCard = resolved.card ?? customCard;
+    expectedLinks = resolved.expectedLinks ?? expectedLinks;
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'link_ref_ledger_unavailable';
+    const stable = code.startsWith('link_ref_') || code === 'expected_link_invalid_after_link_ref'
+      ? code
+      : 'link_ref_ledger_unavailable';
+    console.error(`botmux send refused: ${stable}`);
+    process.exit(2);
+  }
+  for (const expectedLink of expectedLinks) {
+    let url: URL;
+    try { url = new URL(expectedLink); } catch {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+  }
   // File-only final inspection happens before the common validation block below
   // so validate every attachment here. This preserves the established Chinese
   // error instead of leaking createReadStream's raw ENOENT stack.
@@ -10783,11 +10867,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     const { extractCardContent } = await import('./im/lark/message-parser.js');
     expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
   }
-  const expectedLinkPreparedFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
-  if (!customCard && expectedLinkPreparedFile) {
-    try { expectedLinkRenderedContent = readFileSync(expectedLinkPreparedFile, 'utf-8'); }
-    catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
-  }
+  if (!customCard && preparedText !== undefined) expectedLinkRenderedContent = preparedText;
   const fileOnlyPrimaryRequested = !customCard
     && !expectedLinkRenderedContent.trim()
     && !asChoice
@@ -12158,10 +12238,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // sandbox namespace. Voice/doc-comment paths returned above use the same
     // already-sanitized outbound content, without card-markdown preparation.
     let text = extractCardText(content);
-    const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
-    if (preparedContentFile) {
-      try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
-    }
+    if (preparedText !== undefined) text = preparedText;
 
     // `preparedContentFile` is presentation data produced inside an untrusted
     // sandbox and only TOCTOU-materialized by the host watcher. It is not an

@@ -150,11 +150,7 @@ function validExpectedLink(value: string): boolean {
   }
 }
 
-export function resolveOutboundLinkRefs(
-  ledger: LinkRefLedger,
-  key: LinkRefTurnKey,
-  payload: OutboundLinkRefPayload,
-): ResolvedOutboundLinkRefs {
+function tokenizeOutboundPayload(payload: OutboundLinkRefPayload): Map<string, ExecutableLinkRefs> {
   const tokenized = new Map<string, ExecutableLinkRefs>();
   const getTokenized = (text: string): ExecutableLinkRefs => {
     const existing = tokenized.get(text);
@@ -163,14 +159,26 @@ export function resolveOutboundLinkRefs(
     tokenized.set(text, found);
     return found;
   };
-
   if (payload.text !== undefined) getTokenized(payload.text);
   if (payload.preparedText !== undefined) getTokenized(payload.preparedText);
   if (payload.expectedLinks) for (const expectedLink of payload.expectedLinks) getTokenized(expectedLink);
   if (payload.card) walkStrings(payload.card, (text) => { getTokenized(text); return text; });
+  return tokenized;
+}
 
-  const refIds = [...new Set([...tokenized.values()].flatMap((entry) => entry.refIds))];
-  const resolved = refIds.length === 0 ? new Map<string, string>() : ledger.resolveBatch(key, refIds);
+export function findOutboundExecutableLinkRefs(payload: OutboundLinkRefPayload): string[] {
+  return [...new Set(
+    [...tokenizeOutboundPayload(payload).values()].flatMap((entry) => entry.refIds),
+  )];
+}
+
+export function expandOutboundLinkRefs(
+  payload: OutboundLinkRefPayload,
+  resolved: ReadonlyMap<string, string>,
+): ResolvedOutboundLinkRefs {
+  const tokenized = tokenizeOutboundPayload(payload);
+  const getTokenized = (text: string): ExecutableLinkRefs => tokenized.get(text)
+    ?? findExecutableLinkRefs(text);
   const replace = (text: string): string => getTokenized(text).expand(resolved);
   const expectedLinks = payload.expectedLinks?.map(replace);
   if (expectedLinks?.some((value) => !validExpectedLink(value))) {
@@ -181,6 +189,16 @@ export function resolveOutboundLinkRefs(
     ...(payload.preparedText === undefined ? {} : { preparedText: replace(payload.preparedText) }),
     ...(payload.card === undefined ? {} : { card: walkStrings(payload.card, replace) as Record<string, unknown> }),
     ...(expectedLinks === undefined ? {} : { expectedLinks }),
-    refCount: refIds.length,
+    refCount: findOutboundExecutableLinkRefs(payload).length,
   };
+}
+
+export function resolveOutboundLinkRefs(
+  ledger: LinkRefLedger,
+  key: LinkRefTurnKey,
+  payload: OutboundLinkRefPayload,
+): ResolvedOutboundLinkRefs {
+  const refIds = findOutboundExecutableLinkRefs(payload);
+  const resolved = refIds.length === 0 ? new Map<string, string>() : ledger.resolveBatch(key, refIds);
+  return expandOutboundLinkRefs(payload, resolved);
 }

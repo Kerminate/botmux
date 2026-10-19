@@ -145,6 +145,38 @@ const REGISTER_BODY_KEYS = new Set([
   'originTurnId',
   'originDispatchAttempt',
 ]);
+const RESOLVE_BODY_KEYS = new Set([
+  'payload',
+  'originCapability',
+  'originTurnId',
+  'originDispatchAttempt',
+]);
+const RESOLVE_PAYLOAD_KEYS = new Set(['text', 'preparedText', 'card', 'expectedLinks']);
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function parseLinkRefResolveBody(
+  value: unknown,
+): { ok: true; payload: OutboundLinkRefPayload } | { ok: false } {
+  if (!plainRecord(value) || Object.keys(value).some(key => !RESOLVE_BODY_KEYS.has(key))) {
+    return { ok: false };
+  }
+  const payload = value.payload;
+  if (!plainRecord(payload) || Object.keys(payload).some(key => !RESOLVE_PAYLOAD_KEYS.has(key))) {
+    return { ok: false };
+  }
+  if (payload.text !== undefined && typeof payload.text !== 'string') return { ok: false };
+  if (payload.preparedText !== undefined && typeof payload.preparedText !== 'string') return { ok: false };
+  if (payload.card !== undefined && !plainRecord(payload.card)) return { ok: false };
+  if (payload.expectedLinks !== undefined
+    && (!Array.isArray(payload.expectedLinks)
+      || payload.expectedLinks.some(link => typeof link !== 'string'))) return { ok: false };
+  return { ok: true, payload: payload as OutboundLinkRefPayload };
+}
 
 export function emptyLinkRefExtractionStats(): LinkRefExtractionStats {
   return {

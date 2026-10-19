@@ -2,6 +2,7 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { __setLoopbackTransportForTests } from '../../src/core/loopback-fetch.js';
+import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -61,10 +62,50 @@ const topicLookups = new Map<string, number>();
   }
   return { data, status: 200, statusText: 'OK', headers: {}, config };
 };
-if (process.env.BOTMUX_TEST_DURABLE_SEND === '1') {
+if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK_REF_URL) {
   __setLoopbackTransportForTests(async (url, init) => {
     const target = new URL(url);
     const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    if (target.pathname.endsWith('/link-refs/resolve')) {
+      console.log('CAPTURE_LINK_REF_RESOLVE=' + JSON.stringify({
+        method: init.method,
+        path: target.pathname,
+        body,
+      }));
+      const exactUrl = process.env.BOTMUX_TEST_LINK_REF_URL;
+      const acceptedRef = process.env.BOTMUX_TEST_LINK_REF_ID;
+      const resolved = new Map(exactUrl && acceptedRef ? [[acceptedRef, exactUrl]] : []);
+      const expand = (value: string): string => findExecutableLinkRefs(value).expand(resolved);
+      const walk = (value: unknown): unknown => {
+        if (typeof value === 'string') return expand(value);
+        if (Array.isArray(value)) return value.map(walk);
+        if (!value || typeof value !== 'object') return value;
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, walk(entry)]));
+      };
+      try {
+        const payload = body?.payload ?? {};
+        return new Response(JSON.stringify({
+          ok: true,
+          payload: {
+            ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
+            ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
+            ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
+            ...(payload.expectedLinks === undefined
+              ? {}
+              : { expectedLinks: payload.expectedLinks.map(expand) }),
+            refCount: 1,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : 'link_ref_unknown';
+        return new Response(JSON.stringify({ ok: false, error: code }), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    }
     console.log('CAPTURE_DURABLE=' + JSON.stringify({
       method: init.method,
       path: target.pathname,
