@@ -325,6 +325,8 @@ export interface DaemonSession {
    * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
    * bot-added / scheduler / system bootstrap) never infers it. */
   pendingCodexAppSteerable?: true;
+  /** LinkRef mode frozen when a pending-repository opening was admitted. */
+  pendingLinkRefMode?: import('../services/link-ref-types.js').LinkRefMode;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */

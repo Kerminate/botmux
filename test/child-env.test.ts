@@ -214,6 +214,12 @@ describe('redactChildEnv()', () => {
     expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
   });
 
+  it('keeps the daemon-only LinkRef rollout setting out of CLI children', () => {
+    const out = redactChildEnv({ BOTMUX_LINK_REFS_MODE: 'enabled', KEEP: 'v' });
+    expect(out.BOTMUX_LINK_REFS_MODE).toBeUndefined();
+    expect(out.KEEP).toBe('v');
+  });
+
   // Two REAL-CHILD guards for the same leak vector, split by transport.
   //
   // The plain-spawn one runs everywhere. The node-pty one is Node-only, because

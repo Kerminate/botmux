@@ -219,6 +219,7 @@ import {
   resolveQuarantinedForkPlan,
   restartCounts,
   sendWorkerInput,
+  admitQueuedActivationTail,
   setActiveSessionsRegistry,
   suspendWorker,
 } from '../src/core/worker-pool.js';
@@ -241,6 +242,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
@@ -337,6 +339,7 @@ beforeEach(() => {
     closeSession: vi.fn(),
   });
   setActiveSessionsRegistry(undefined);
+  setLinkRefRuntime(undefined);
 });
 
 afterEach(() => {
@@ -344,6 +347,130 @@ afterEach(() => {
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
+  setLinkRefRuntime(undefined);
+});
+
+describe('LinkRef turn admission mode freeze', () => {
+  it('resolves an unfrozen source sidecar at the real fork boundary', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<link-ref-companion />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+
+    forkWorker(ds, {
+      content: 'task',
+      linkRefs: {
+        // Builder placeholder only: sources mean this envelope has not crossed
+        // the daemon admission boundary and therefore is not frozen yet.
+        mode: 'disabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'source' }],
+      },
+    }, { turnId: 'om_link_ref_admit' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(init.prompt).toContain('<link-ref-companion />');
+    expect(init.linkRefMode).toBe('enabled');
+  });
+
+  it('reuses a source-free mode already frozen in a queued record', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'disabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => payload);
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+
+    forkWorker(ds, {
+      content: 'queued task',
+      linkRefs: { mode: 'observe' },
+    }, { turnId: 'om_link_ref_frozen' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).not.toHaveBeenCalled();
+    expect(init.linkRefMode).toBe('observe');
+  });
+
+  it('freezes mode when a successor first enters the durable activation tail', () => {
+    const bot = defaultBot({ linkRefs: { mode: 'enabled' } });
+    vi.mocked(getBot).mockImplementation(() => bot);
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<frozen-link-ref />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs({ worker: makeFakeWorker() });
+
+    admitQueuedActivationTail(ds, {
+      userPrompt: 'queued',
+      turnId: 'om_link_ref_tail',
+      cliInput: {
+        content: 'queued',
+        linkRefs: {
+          mode: 'disabled',
+          sources: [{ sourceType: 'user_message', kind: 'text', text: 'queued source' }],
+        },
+      },
+    });
+    bot.config.linkRefs = { mode: 'disabled' };
+
+    expect(ds.session.queuedActivationTail?.[0]?.cliInput).toEqual(expect.objectContaining({
+      content: expect.stringContaining('<frozen-link-ref />'),
+      linkRefs: { mode: 'enabled' },
+    }));
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect(ds.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_link_ref_tail',
+      linkRefMode: 'enabled',
+    }));
+  });
+
+  it('uses the pending-repository mode frozen before a later config change', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'disabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<pending-link-ref />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+    ds.pendingLinkRefMode = 'enabled';
+
+    forkWorker(ds, {
+      content: 'pending opening',
+      linkRefs: {
+        mode: 'disabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'pending source' }],
+      },
+    }, { turnId: 'om_pending_link_ref' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(init.prompt).toContain('<pending-link-ref />');
+    expect(init.linkRefMode).toBe('enabled');
+  });
+
+  it('does not upgrade a pending-repository turn frozen as disabled', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => payload);
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+    ds.pendingLinkRefMode = 'disabled';
+
+    forkWorker(ds, { content: 'legacy pending opening' }, { turnId: 'om_pending_disabled' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).not.toHaveBeenCalled();
+    expect(init.prompt).toBe('legacy pending opening');
+    expect(init).not.toHaveProperty('linkRefMode');
+  });
 });
 
 describe('narrow XPI shared-cwd generation admission seam', () => {

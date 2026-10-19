@@ -266,6 +266,9 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // boundary is safe. Kept as a string literal (like the keys above) with a
   // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
   'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+  // Daemon-only LinkRef rollout authority. Workers and CLI children receive
+  // only the frozen typed turn mode through authenticated IPC.
+  'BOTMUX_LINK_REFS_MODE',
 ] as const;
 
 /**

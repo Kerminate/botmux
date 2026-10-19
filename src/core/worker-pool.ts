@@ -158,6 +158,10 @@ import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
+import { prepareLinkRefTurnPayload } from './link-ref-turn.js';
+import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
@@ -796,7 +800,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -806,6 +810,53 @@ function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // workflows/v3/ephemeral-pool.ts.
   scrubWorkflowWorkerEnv(env);
   return env;
+}
+
+function prepareAdmittedLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+  turnId?: string;
+  dispatchAttempt?: number;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  // `sources` exist only before the real admission boundary, so their mode is
+  // a builder placeholder and must not freeze an earlier config snapshot. A
+  // source-free envelope is already admitted (queued/recovered) and its typed
+  // mode is copied verbatim even if live configuration changed meanwhile.
+  const pendingMode = input.ds.pendingLinkRefMode;
+  const mode = pendingMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+    ? declaredMode
+    : resolveEffectiveLinkRefMode({
+        env: process.env,
+        bot: getBot(input.ds.larkAppId).config.linkRefs,
+        global: readGlobalConfig().linkRefs,
+      }));
+  if (!input.turnId || mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode: 'disabled' };
+  }
+  if (input.payload.linkRefs?.sources === undefined && declaredMode) {
+    return { payload: input.payload, mode };
+  }
+  const runtime = getLinkRefRuntime();
+  if (!runtime) {
+    return { payload: { ...input.payload, linkRefs: { mode } }, mode };
+  }
+  return {
+    payload: prepareLinkRefTurnPayload({
+      runtime,
+      key: {
+        appId: input.ds.larkAppId,
+        sessionId: input.ds.session.sessionId,
+        turnId: input.turnId,
+        dispatchAttempt: input.dispatchAttempt,
+      },
+      mode,
+      payload: input.payload,
+    }),
+    mode,
+  };
 }
 
 /** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
@@ -11755,13 +11806,20 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
-  const normalized = typeof payload === 'string' ? { content: payload } : payload;
+  let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
     : undefined);
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: normalized,
+    turnId: effectiveTurnId,
+    dispatchAttempt: opts.dispatchAttempt,
+  });
+  normalized = admittedLinkRefs.payload;
   const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
   const routingTurnId = turnId ?? replyTurnId;
   const replyContext = frozenReplyContextForTurn(ds, routingTurnId);
@@ -11799,6 +11857,7 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          ...(normalized.linkRefs ? { linkRefs: normalized.linkRefs } : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
@@ -11872,6 +11931,7 @@ export function sendWorkerInput(
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
@@ -12200,6 +12260,7 @@ export function promoteQueuedActivationTail(
   const exactInput: CliTurnPayload = {
     content: head.cliInput.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
     // R5-B1-2: preserve the frozen steer authorization onto the promoted
     // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
@@ -12271,6 +12332,9 @@ export function promoteQueuedActivationTail(
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
+      ...(exactInput.linkRefs?.mode && exactInput.linkRefs.mode !== 'disabled'
+        ? { linkRefMode: exactInput.linkRefs.mode }
+        : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
@@ -12346,24 +12410,34 @@ export function admitQueuedActivationTail(
   reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
   opts: { codexAppInputGateFrozen?: boolean } = {},
 ): QueuedActivationTailEntry {
+  const admittedLinkRefs = entry.cliInput.linkRefs
+    ? prepareAdmittedLinkRefPayload({
+        ds,
+        payload: entry.cliInput,
+        turnId: entry.turnId,
+        dispatchAttempt: entry.dispatchAttempt,
+      })
+    : { payload: entry.cliInput, mode: 'disabled' as const };
+  const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
-    ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+    ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
     : reservation.codexAppInputAccepted === true
-      ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+      ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
     id: reservation.id,
     order: reservation.order,
     ...entry,
     cliInput: {
-      content: entry.cliInput.content,
+      content: frozenInput.content,
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+      ...(frozenInput.linkRefs ? { linkRefs: frozenInput.linkRefs } : {}),
       // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
       // (only `=== true`, never truthy). Dropping it here silently un-authorized
       // every queued/opening turn — the strip point that defeated the R4 fix.
-      ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
-      ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
-      ...(entry.cliInput.trustedController ? { trustedController: entry.cliInput.trustedController } : {}),
+      ...(frozenInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      ...(frozenInput.trustedCaller ? { trustedCaller: frozenInput.trustedCaller } : {}),
+      ...(frozenInput.trustedController ? { trustedController: frozenInput.trustedController } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -12767,7 +12841,7 @@ export function forkWorker(
     return false;
   }
 
-  const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  let promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   // Re-read after the group background is committed at the real execution
   // boundary below (after every defer/queue/admission return).
   let prompt = promptPayload.content;
@@ -12835,6 +12909,7 @@ export function forkWorker(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
+          ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
@@ -13167,11 +13242,6 @@ export function forkWorker(
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
   bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
-  // A fork carries the opening/queued input straight into the worker init, so
-  // this (past every XPI/defer/admission return, at the reserved generation)
-  // is its delivery boundary; sendWorkerInput is not on this path.
-  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
-  prompt = promptPayload.content;
   onWorkerGenerationReserved?.(workerGeneration);
   if (initAttributionTurnId?.startsWith('om_')) {
     ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
@@ -13211,6 +13281,18 @@ export function forkWorker(
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
+  const admittedOpeningLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: promptPayload,
+    turnId: initAttributionTurnId,
+    dispatchAttempt: initDispatchAttempt,
+  });
+  promptPayload = admittedOpeningLinkRefs.payload;
+  prompt = promptPayload.content;
+  // A fork carries the opening/queued input straight into worker init. Freeze
+  // LinkRefs only after every defer/refusal seam and launch-config snapshot,
+  // immediately before irreversible child-launch preparation.
+  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -13354,6 +13436,7 @@ export function forkWorker(
     ds.session.queuedActivationInput = {
       content: prompt,
       ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
@@ -13710,6 +13793,9 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(admittedOpeningLinkRefs.mode === 'disabled'
+      ? {}
+      : { linkRefMode: admittedOpeningLinkRefs.mode }),
     ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
