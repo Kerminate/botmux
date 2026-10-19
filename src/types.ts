@@ -17,6 +17,7 @@ import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnap
 import type { CliId } from './adapters/cli/types.js';
 import type { CliRuntimeSnapshot } from './adapters/cli/runtime.js';
 import type { CliLaunchMode } from './core/cli-launch-mode.js';
+import type { LinkRefTurnEnvelope } from './services/link-ref-types.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -1752,6 +1753,8 @@ export interface CodexAppGenerationCommit {
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
+  /** Daemon-frozen LinkRef mode plus admission-only source material. */
+  linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
