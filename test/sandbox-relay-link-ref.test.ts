@@ -67,8 +67,13 @@ process.stdout.write('HOST_ENV=' + JSON.stringify({
   adminMode: process.env.BOTMUX_LINK_REFS_MODE ?? null,
   turnMode: process.env.BOTMUX_LINK_REF_TURN_MODE ?? null,
 }) + '\\n');
-const { tsImport } = await import(${JSON.stringify(pathToFileURL(tsxApi).href)});
-await tsImport(${JSON.stringify(pathToFileURL(fixture).href)}, import.meta.url);
+const fixture = ${JSON.stringify(pathToFileURL(fixture).href)};
+if (typeof Bun !== 'undefined') {
+  await import(fixture);
+} else {
+  const { tsImport } = await import(${JSON.stringify(pathToFileURL(tsxApi).href)});
+  await tsImport(fixture, import.meta.url);
+}
 `);
   chmodSync(wrapper, 0o755);
   return { root, outbox, dataDir, sessionId, turnId, botsPath, wrapper };

@@ -755,7 +755,9 @@ describe('worker structured-turn status wiring', () => {
     const handler = source.slice(source.indexOf("case 'message':"), source.indexOf("case 'raw_input':"));
     expect(handler).toContain('await runAdoptMessageForCapturedGeneration(item, () =>');
     expect(handler).toContain('msg.dispatchAttempt');
-    expect(adopt).toContain('adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt)');
+    expect(adopt).toMatch(
+      /adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn\(\s*content,\s*turnId,\s*dispatchAttempt,\s*Date\.now\(\),\s*linkRefMode,\s*\)/,
+    );
     expect(adopt).toContain('scheduleSubmitFailureNotify(');
     expect(adopt).toContain("t('worker.transcriptLabel')");
     expect(adopt).toContain('dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt)');
