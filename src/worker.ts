@@ -18665,7 +18665,10 @@ async function spawnCli(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
-    const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
+    const hostOnlyDenyPaths: string[] = [
+      join(canonical(dataDir), 'schedule-preconditions'),
+      join(canonical(dataDir), 'link-refs'),
+    ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
