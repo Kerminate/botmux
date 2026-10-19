@@ -157,6 +157,17 @@ export class LinkRefLedger {
     }
   }
 
+  private retryBusy<T>(operation: () => T): T {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return operation();
+      } catch (error) {
+        if (!isBusy(error) || attempt >= 2) throw error;
+        boundedBusyJitter(attempt + 1);
+      }
+    }
+  }
+
   private turnRow(key: LinkRefTurnKey): TurnRow | undefined {
     return this.db.prepare(`
       SELECT * FROM link_ref_turns
@@ -271,52 +282,60 @@ export class LinkRefLedger {
   }
 
   resolveBatch(key: LinkRefTurnKey, refIds: readonly string[]): Map<string, string> {
-    const unique = [...new Set(refIds)];
-    if (unique.length === 0) return new Map();
-    const rows = unique.map((refId) => this.db.prepare(`
-      SELECT ref_id, app_id, session_id, turn_id, dispatch_attempt, original_url
-      FROM link_refs WHERE ref_id = ?
-    `).get(refId) as LinkRow | undefined);
-    const missingIndex = rows.findIndex((row) => !row);
-    if (missingIndex >= 0) throw new LinkRefError('link_ref_unknown');
-    for (const row of rows as LinkRow[]) {
-      if (
-        row.app_id !== key.appId
-        || row.session_id !== key.sessionId
-        || row.turn_id !== key.turnId
-        || row.dispatch_attempt !== attemptOf(key)
-      ) {
-        throw new LinkRefError('link_ref_identity_mismatch');
+    return this.retryBusy(() => {
+      const unique = [...new Set(refIds)];
+      if (unique.length === 0) return new Map();
+      const rows = unique.map((refId) => this.db.prepare(`
+        SELECT ref_id, app_id, session_id, turn_id, dispatch_attempt, original_url
+        FROM link_refs WHERE ref_id = ?
+      `).get(refId) as LinkRow | undefined);
+      const missingIndex = rows.findIndex((row) => !row);
+      if (missingIndex >= 0) throw new LinkRefError('link_ref_unknown');
+      for (const row of rows as LinkRow[]) {
+        if (
+          row.app_id !== key.appId
+          || row.session_id !== key.sessionId
+          || row.turn_id !== key.turnId
+          || row.dispatch_attempt !== attemptOf(key)
+        ) {
+          throw new LinkRefError('link_ref_identity_mismatch');
+        }
       }
-    }
-    this.requireTurn(key);
-    return new Map((rows as LinkRow[]).map((row) => [row.ref_id, row.original_url]));
+      this.requireTurn(key);
+      return new Map((rows as LinkRow[]).map((row) => [row.ref_id, row.original_url]));
+    });
   }
 
   savePendingDraft(key: LinkRefTurnKey, content: string): void {
-    this.requireTurn(key);
-    this.db.prepare(`
-      INSERT INTO link_ref_pending_drafts (
-        app_id, session_id, turn_id, dispatch_attempt, content, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(app_id, session_id, turn_id, dispatch_attempt)
-      DO UPDATE SET content = excluded.content, updated_at_ms = excluded.updated_at_ms
-    `).run(...keyParams(key), content, this.now());
+    this.retryBusy(() => {
+      this.requireTurn(key);
+      this.db.prepare(`
+        INSERT INTO link_ref_pending_drafts (
+          app_id, session_id, turn_id, dispatch_attempt, content, updated_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id, session_id, turn_id, dispatch_attempt)
+        DO UPDATE SET content = excluded.content, updated_at_ms = excluded.updated_at_ms
+      `).run(...keyParams(key), content, this.now());
+    });
   }
 
   readPendingDraft(key: LinkRefTurnKey): string | undefined {
-    const row = this.db.prepare(`
-      SELECT content FROM link_ref_pending_drafts
-      WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
-    `).get(...keyParams(key)) as { content: string } | undefined;
-    return row?.content;
+    return this.retryBusy(() => {
+      const row = this.db.prepare(`
+        SELECT content FROM link_ref_pending_drafts
+        WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
+      `).get(...keyParams(key)) as { content: string } | undefined;
+      return row?.content;
+    });
   }
 
   clearPendingDraft(key: LinkRefTurnKey): void {
-    this.db.prepare(`
-      DELETE FROM link_ref_pending_drafts
-      WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
-    `).run(...keyParams(key));
+    this.retryBusy(() => {
+      this.db.prepare(`
+        DELETE FROM link_ref_pending_drafts
+        WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
+      `).run(...keyParams(key));
+    });
   }
 
   settleTurn(key: LinkRefTurnKey): void {

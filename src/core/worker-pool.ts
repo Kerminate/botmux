@@ -11335,6 +11335,7 @@ function acceptCodexAppDispatch(
     replyTargetSenderIsBot?: boolean;
     queuedActivationToken?: string;
     codexAppSteerable?: true;
+    linkRefMode?: 'observe' | 'enabled';
   },
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
@@ -11368,6 +11369,7 @@ function acceptCodexAppDispatch(
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
       ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(payload.linkRefMode ? { linkRefMode: payload.linkRefMode } : {}),
       content: payload.content,
       ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
@@ -11916,6 +11918,9 @@ export function sendWorkerInput(
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedLinkRefs.mode }),
     },
     effectiveTurnId,
     opts.dispatchAttempt,
@@ -12308,6 +12313,9 @@ export function promoteQueuedActivationTail(
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
         ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
+        ...(exactInput.linkRefs?.mode && exactInput.linkRefs.mode !== 'disabled'
+          ? { linkRefMode: exactInput.linkRefs.mode }
+          : {}),
       },
       head.turnId,
       head.dispatchAttempt,
@@ -13444,6 +13452,9 @@ export function forkWorker(
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedOpeningLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedOpeningLinkRefs.mode }),
       ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
       ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     };
@@ -13478,6 +13489,9 @@ export function forkWorker(
           // accept-ledger entry so a recovered/opening first turn is steerable
           // exactly as the daemon admitted it (admission computed once; COPIED).
           ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(admittedOpeningLinkRefs.mode === 'disabled'
+            ? {}
+            : { linkRefMode: admittedOpeningLinkRefs.mode }),
         },
         initAttributionTurnId,
         initDispatchAttempt,
@@ -18894,6 +18908,61 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
+  const unresolvedMsg = msg;
+  const linkRefKey = {
+    appId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    turnId: msg.turnId,
+    dispatchAttempt: msg.dispatchAttempt,
+  };
+  const linkRefRuntime = msg.linkRefMode ? getLinkRefRuntime() : undefined;
+  let linkRefDraftPending = false;
+  if (msg.linkRefMode === 'enabled') {
+    try {
+      if (!linkRefRuntime) throw new Error('link_ref_ledger_unavailable');
+      const prepared = linkRefRuntime.prepareFinalDraft({
+        key: linkRefKey,
+        mode: msg.linkRefMode,
+        content: msg.content,
+      });
+      linkRefDraftPending = prepared.draftPending;
+      if (prepared.content !== msg.content) msg = { ...msg, content: prepared.content };
+    } catch (error) {
+      const errorCode = typeof error === 'object' && error && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : 'link_ref_ledger_unavailable';
+      const next = attempt + 1;
+      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        logger.error(
+          `[${t}] LinkRef final preparation gave up after ${next} attempts `
+          + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode})`,
+        );
+        onComplete?.(false);
+        return;
+      }
+      logger.warn(
+        `[${t}] LinkRef final preparation attempt ${next} failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode}); retrying`,
+      );
+      setTimeout(() => deliverFinalOutput(
+        ds, unresolvedMsg, t, next, onComplete, isStillOwned,
+        frozenReplyTarget, frozenUsage, frozenInitiator, imageFallback,
+      ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
+      return;
+    }
+  }
+  const confirmLinkRefDraft = (): void => {
+    if (!linkRefDraftPending || !linkRefRuntime) return;
+    try {
+      linkRefRuntime.clearPendingDraft(linkRefKey);
+      linkRefDraftPending = false;
+    } catch {
+      logger.warn(
+        `[${t}] LinkRef final draft cleanup failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+      );
+    }
+  };
   let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
@@ -18959,6 +19028,7 @@ function deliverFinalOutput(
       rememberHttpTerminal(ds, msg.turnId);
       ds.idempotentAsyncTurns?.delete(msg.turnId);
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      confirmLinkRefDraft();
       onComplete?.(true);
       return;
     }
@@ -18993,6 +19063,7 @@ function deliverFinalOutput(
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -19026,6 +19097,7 @@ function deliverFinalOutput(
     ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -19127,6 +19199,7 @@ function deliverFinalOutput(
           }
         }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        confirmLinkRefDraft();
         onComplete?.(true);
         return;
       }
@@ -19470,6 +19543,7 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        confirmLinkRefDraft();
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -19567,7 +19641,14 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
-      if (!isStillOwned()) { onComplete?.(true); return; }
+      if (!isStillOwned()) {
+        // The provider already returned its stable message id. Ownership loss
+        // only suppresses later local bookkeeping; it cannot make that external
+        // effect un-happen, so the exact unresolved retry draft is confirmed.
+        confirmLinkRefDraft();
+        onComplete?.(true);
+        return;
+      }
       if (messageId && !managedReceiver) {
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
@@ -19632,6 +19713,7 @@ function deliverFinalOutput(
         ...(unifiedReply?.record.overflowMessageId
           ? [{ kind: 'attachment' as const, messageId: unifiedReply.record.overflowMessageId }] : []),
       ]), finalPublication?.receipt.reason));
+      confirmLinkRefDraft();
       onComplete?.(true, messageId);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
@@ -19747,7 +19829,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
+      deliverFinalOutput(ds, unresolvedMsg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

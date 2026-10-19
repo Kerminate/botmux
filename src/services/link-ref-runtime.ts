@@ -4,16 +4,18 @@ import { collectLinkRefCandidates } from './link-ref-extractor.js';
 import { LinkRefLedger } from './link-ref-ledger.js';
 import { renderLinkRefCompanion } from './link-ref-presenter.js';
 import {
+  findExecutableLinkRefs,
   resolveOutboundLinkRefs,
   type OutboundLinkRefPayload,
   type ResolvedOutboundLinkRefs,
 } from './link-ref-resolver.js';
-import type {
-  LinkRefDiagnostic,
-  LinkRefExtractionStats,
-  LinkRefMode,
-  LinkRefSourceInput,
-  LinkRefTurnKey,
+import {
+  LinkRefError,
+  type LinkRefDiagnostic,
+  type LinkRefExtractionStats,
+  type LinkRefMode,
+  type LinkRefSourceInput,
+  type LinkRefTurnKey,
 } from './link-ref-types.js';
 
 export interface LinkRefRuntime {
@@ -33,6 +35,12 @@ export interface LinkRefRuntime {
     payload: OutboundLinkRefPayload,
   ): ResolvedOutboundLinkRefs;
   restoreMode(key: LinkRefTurnKey): 'enabled' | undefined;
+  prepareFinalDraft(input: {
+    key: LinkRefTurnKey;
+    mode: LinkRefMode;
+    content: string;
+  }): { content: string; draftPending: boolean };
+  clearPendingDraft(key: LinkRefTurnKey): void;
   settleTurn(key: LinkRefTurnKey): void;
   deleteSession(appId: string, sessionId: string): number;
   pruneExpired(nowMs?: number): { expired: number; removed: number };
@@ -126,6 +134,32 @@ export function createLinkRefRuntime(
       return row?.mode === 'enabled' && row.state === 'open' && row.expiresAtMs > Date.now()
         ? 'enabled'
         : undefined;
+    },
+    prepareFinalDraft({ key, mode, content }) {
+      if (mode !== 'enabled') return { content, draftPending: false };
+      const executable = findExecutableLinkRefs(content);
+      if (executable.refIds.length === 0) {
+        return { content: executable.expand(new Map()), draftPending: false };
+      }
+      const store = ledger();
+      let draft: string;
+      try {
+        const persisted = store.readPendingDraft(key);
+        draft = persisted ?? content;
+        if (persisted === undefined) store.savePendingDraft(key, draft);
+      } catch {
+        throw new LinkRefError('link_ref_ledger_unavailable');
+      }
+      try {
+        const resolved = resolveOutboundLinkRefs(store, key, { text: draft });
+        return { content: resolved.text ?? draft, draftPending: true };
+      } catch (error) {
+        if (error instanceof LinkRefError) throw error;
+        throw new LinkRefError('link_ref_ledger_unavailable');
+      }
+    },
+    clearPendingDraft(key) {
+      openedLedger?.clearPendingDraft(key);
     },
     settleTurn(key) {
       openedLedger?.settleTurn(key);

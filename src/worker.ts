@@ -3609,6 +3609,36 @@ let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentBotmuxLinkRefMode: 'observe' | 'enabled' | undefined;
+const frozenTurnLinkRefModes = new Map<string, 'disabled' | 'observe' | 'enabled'>();
+
+function turnLinkRefModeKey(turnId: string, dispatchAttempt?: number): string {
+  return `${turnId}\u0000${dispatchAttempt ?? 0}`;
+}
+
+/** Freeze once from daemon-owned turn metadata. A later type-ahead turn may
+ * replace the mutable current-turn globals before an older final arrives. */
+function rememberTurnLinkRefMode(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  mode: 'observe' | 'enabled' | undefined,
+): void {
+  if (!turnId) return;
+  const key = turnLinkRefModeKey(turnId, dispatchAttempt);
+  if (!frozenTurnLinkRefModes.has(key)) {
+    frozenTurnLinkRefModes.set(key, mode ?? 'disabled');
+    while (frozenTurnLinkRefModes.size > 256) {
+      frozenTurnLinkRefModes.delete(frozenTurnLinkRefModes.keys().next().value!);
+    }
+  }
+}
+
+function frozenTurnLinkRefMode(
+  turnId: string,
+  dispatchAttempt?: number,
+): 'observe' | 'enabled' | undefined {
+  const mode = frozenTurnLinkRefModes.get(turnLinkRefModeKey(turnId, dispatchAttempt));
+  return mode === 'observe' || mode === 'enabled' ? mode : undefined;
+}
 /** Open id of the human whose turn currentBotmuxTurnId belongs to. Published
  *  alongside the live-turn marker so the identity wrapper can keep a
  *  same-principal credential across consecutive turns. */
@@ -6010,6 +6040,7 @@ function restoreScheduledTaskAnchorsOnce(): void {
 function journalBridgeTurnMark(entry: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   markTimeMs: number;
   fingerprint?: string;
   contentNormalized?: string;
@@ -6501,13 +6532,14 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
     return skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   for (const entry of restorable) {
+    rememberTurnLinkRefMode(entry.turnId, entry.dispatchAttempt, entry.linkRefMode);
     bridgeQueue.mark(
       entry.turnId,
       entry.fingerprint,
       entry.markTimeMs,
       entry.contentNormalized,
       entry.dispatchAttempt,
-      { restoredFromJournal: true },
+      { restoredFromJournal: true, linkRefMode: entry.linkRefMode },
     );
   }
   bridgeOffset = drained.newOffset;
@@ -7441,6 +7473,7 @@ function bridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
+  linkRefMode?: 'observe' | 'enabled',
 ): string | undefined {
   if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
@@ -7476,7 +7509,7 @@ function bridgeMarkPendingTurn(
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
   const turnId = preferredTurnId ?? randomBytes(8).toString('hex');
   const markTimeMs = Date.now();
-  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt);
+  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt, { linkRefMode });
   // Journal the mark so a worker/daemon restart mid-turn can restore it
   // (bridgeAbsorbBaseline). Excluded:
   //   - adopt mode: its baseline absorbs the whole transcript with different
@@ -7492,6 +7525,7 @@ function bridgeMarkPendingTurn(
     journalBridgeTurnMark({
       turnId,
       dispatchAttempt,
+      linkRefMode,
       markTimeMs,
       fingerprint,
       contentNormalized,
@@ -7569,6 +7603,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // A restored structured turn may predate every in-memory admission map in
+    // this worker generation. Re-freeze its exact journaled mode before the
+    // final crosses workerIpcPayload, which deliberately ignores caller fields.
+    rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, turn.linkRefMode);
     // Claude API-error text is execution metadata, not a model answer. The
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
@@ -9266,11 +9304,12 @@ function codexBridgeMarkPendingTurn(
   preferredTurnId?: string,
   dispatchAttempt?: number,
   markTimeMs: number = Date.now(),
+  linkRefMode?: 'observe' | 'enabled',
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark);
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode);
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -10474,6 +10513,7 @@ async function writeAdoptMessage(
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
+  rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
   if (!executionFence || !adoptWriteFenceIsCurrent(executionFence)) {
     return 'stale-before-write';
@@ -10517,19 +10557,21 @@ async function writeAdoptMessage(
     beginCliWriteCycle();
     if (bridgeJsonlPath) {
       try { bridgeIngest(); } catch { /* best effort */ }
-      bridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+      bridgeMarkPendingTurn(content, turnId, dispatchAttempt, linkRefMode);
     } else if (codexBridgeFallbackActive()) {
       if (structuredBridgeIs('cursor')) {
         // Cursor may append the current line before IPC handling; mark first so
         // the pre-existing line can fingerprint-match instead of becoming seen.
-        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt, Date.now(), linkRefMode);
         try { codexBridgeIngest(); } catch { /* best effort */ }
         // Re-arm the thinking bubble's rowid baseline at this turn's write so
         // only the new turn's reasoning/tool nodes render.
         armCursorCotForTurn();
       } else {
         try { codexBridgeIngest(); } catch { /* best effort */ }
-        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(
+          content, turnId, dispatchAttempt, Date.now(), linkRefMode,
+        );
       }
       if (adoptStructuredBridgeTurnId) {
         codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
@@ -12177,6 +12219,7 @@ async function handleTrustedCodexAppMarker(
     let nativeTurnId: string | undefined;
     let replyTurnId: string | undefined;
     let dispatchAttempt: number | undefined;
+    let linkRefMode: 'observe' | 'enabled' | undefined;
     let codexAppDispatchId: string | undefined;
     let codexAppDispatchHandle: number | undefined;
     if (isCodexAppCliId(lastInitConfig?.cliId)) {
@@ -12197,6 +12240,7 @@ async function handleTrustedCodexAppMarker(
         replyTurnId,
         nativeTurnId,
         dispatchAttempt,
+        linkRefMode,
         dispatchId: codexAppDispatchId,
         handle: codexAppDispatchHandle,
       } = settlement);
@@ -12313,6 +12357,7 @@ async function handleTrustedCodexAppMarker(
         ...(replyTurnId ? { replyTurnId } : {}),
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(linkRefMode ? { linkRefMode } : {}),
         ...((suppressDelivery || isSuperseded) ? { suppressDelivery: true } : {}),
         ...(isSuperseded ? { disposition: 'steer_superseded' as const } : {}),
         codexAppSettlement: {
@@ -12358,6 +12403,7 @@ async function handleTrustedCodexAppMarker(
         turnId,
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(linkRefMode ? { linkRefMode } : {}),
       });
       } else if (isSuperseded) {
         // A superseded member still emits a final_output so the daemon (and any
@@ -12370,6 +12416,7 @@ async function handleTrustedCodexAppMarker(
           lastUuid: turnId,
           turnId,
           ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          ...(linkRefMode ? { linkRefMode } : {}),
           suppressDelivery: true,
           disposition: 'steer_superseded' as const,
         });
@@ -14637,9 +14684,10 @@ async function flushPending(): Promise<void> {
             logicalMsg,
             item.turnId,
             item.dispatchAttempt,
+            item.linkRefMode,
           );
         } else if (codexBridgeActive && !writeRpcEngine) {
-          bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
+          bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, Date.now(), item.linkRefMode);
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
@@ -14712,6 +14760,7 @@ async function flushPending(): Promise<void> {
             // R4-B4: COPY the frozen steer authorization onto the reservation so a
             // superseded settlement can verify the exact head is a steerable turn.
             item.codexAppSteerable ? true : undefined,
+            item.linkRefMode,
           )
         : undefined;
       if (tracksCodexAppLiveness && item.codexAppDispatchId && codexAppFrozenTurnId) {
@@ -15336,6 +15385,7 @@ function sendToPty(
     taskContinuation?: import('./types.js').TaskContinuationDispatchMarker;
   } = {},
 ): boolean {
+  rememberTurnLinkRefMode(turnId, opts.dispatchAttempt, opts.linkRefMode);
   const next: PendingCliInput = {
     content,
     turnId,
@@ -23816,9 +23866,12 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
   const durationMs = timing?.durationMs;
   const executionStartedAtMs = durationMs !== undefined && timing?.completedAtMs !== undefined
     ? timing.completedAtMs - durationMs : undefined;
+  const { linkRefMode: _callerSelectedLinkRefMode, ...trusted } = msg;
+  const linkRefMode = frozenTurnLinkRefMode(msg.turnId, msg.dispatchAttempt);
   return {
-    ...msg,
+    ...trusted,
     ...(sessionId ? { sessionId } : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(executionStartedAtMs !== undefined ? { executionStartedAtMs } : {}),
   };
@@ -24145,6 +24198,9 @@ process.on('message', async (raw: unknown) => {
           ...entry,
           codexAppInput: entry.codexAppInput ? { ...entry.codexAppInput } : undefined,
         }));
+        for (const entry of codexAppRecoveredDispatches) {
+          rememberTurnLinkRefMode(entry.turnId, entry.dispatchAttempt, entry.linkRefMode);
+        }
         codexAppGenerationCommits = [...(msg.codexAppGenerationCommits ?? [])];
         codexAppTurnDispatchQueue.restore(
           codexAppRecoveredDispatches
@@ -24195,6 +24251,7 @@ process.on('message', async (raw: unknown) => {
         // (undefined, undefined) tuple) before any frame can be captured.
         setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined, msg.turnCallerOpenId);
         currentBotmuxLinkRefMode = msg.linkRefMode;
+        rememberTurnLinkRefMode(msg.turnId, msg.dispatchAttempt, msg.linkRefMode);
         if (msg.turnId) {
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           if (msg.prompt) {
@@ -24323,6 +24380,7 @@ process.on('message', async (raw: unknown) => {
             turnId: entry.turnId,
             replyTurnId: entry.replyTurnId,
             dispatchAttempt: entry.dispatchAttempt,
+            linkRefMode: entry.linkRefMode,
             codexAppDispatchId: entry.dispatchId,
             // COPY the frozen steer authorization from the ledger entry; never
             // recompute it on recovery (codex decision A).
@@ -24362,6 +24420,7 @@ process.on('message', async (raw: unknown) => {
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
+            linkRefMode: msg.linkRefMode,
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,

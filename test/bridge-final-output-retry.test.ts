@@ -131,6 +131,11 @@ vi.mock('../src/services/session-lifecycle-hooks.js', () => ({
   setSessionLifecycleShutdown: vi.fn(),
 }));
 
+const linkRefRuntime = vi.hoisted(() => ({ current: undefined as any }));
+vi.mock('../src/services/link-ref-runtime.js', () => ({
+  getLinkRefRuntime: () => linkRefRuntime.current,
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -314,7 +319,33 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     setActiveSessionsRegistry(undefined);
     rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
+    linkRefRuntime.current = undefined;
     vi.useRealTimers();
+  });
+
+  it('expands LinkRefs before markdown card rendering and keeps the worker IPC immutable', async () => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    const clearPendingDraft = vi.fn();
+    const fullUrl = 'https://auth.example.test/approve' + '?code=keep&state=ready';
+    linkRefRuntime.current = {
+      prepareFinalDraft: vi.fn(() => ({ content: `授权：${fullUrl}`, draftPending: true })),
+      clearPendingDraft,
+    };
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const unresolved = '授权：{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}';
+    const msg = { ...finalOutputMsg(), content: unresolved, linkRefMode: 'enabled' as const };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain(fullUrl);
+    expect(sessionReply.mock.calls[0][1]).not.toContain('{{botmux_link:');
+    expect(clearPendingDraft).toHaveBeenCalledOnce();
+    expect(msg.content).toBe(unresolved);
   });
 
   it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
@@ -2264,6 +2295,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).not.toHaveBeenCalled();
     expect(complete).toHaveBeenCalledWith(false);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('clears a LinkRef draft when the provider confirms delivery before ownership changes', async () => {
+    let owned = true;
+    const clearPendingDraft = vi.fn();
+    linkRefRuntime.current = {
+      prepareFinalDraft: vi.fn(() => ({ content: 'expanded answer', draftPending: true })),
+      clearPendingDraft,
+    };
+    const sessionReply = vi.fn(async () => {
+      owned = false;
+      return 'om_provider_confirmed';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+      linkRefMode: 'enabled',
+    }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(clearPendingDraft).toHaveBeenCalledOnce();
   });
 
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {

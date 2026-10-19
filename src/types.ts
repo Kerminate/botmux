@@ -1738,6 +1738,8 @@ export interface CodexAppDispatchLedgerEntry {
    * COPY this flag, never recompute it. */
   codexAppSteerable?: true;
   dispatchAttempt?: number;
+  /** Admission-frozen LinkRef mode for this exact runner submission. */
+  linkRefMode?: 'observe' | 'enabled';
   state: 'accepted' | 'prepared';
   content: string;
   codexAppInput?: CodexAppTurnInput;
@@ -2249,6 +2251,8 @@ export type WorkerToDaemon =
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;
+      /** Admission-frozen mode for this exact turn. Absence is disabled. */
+      linkRefMode?: 'observe' | 'enabled';
       // Discriminator for the daemon-side renderer. Default ('bridge' /
       // omitted) renders `content` through the regular markdown card. The
       // local-turn variants ship the user prompt as a separate field so
