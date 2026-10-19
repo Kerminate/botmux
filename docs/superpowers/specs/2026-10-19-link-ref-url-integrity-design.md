@@ -5,7 +5,7 @@
 会话 `8ee7928d-fda1-4bf3-8f85-f9509d26d4d3` 的来源上下文中存在一条带查询参数的 DACU 链接，但最终消息只发送了：
 
 ```text
-https://dacu.bytedance.net/preview_platform/problem
+https://<dacu-host>/preview_platform/problem
 ```
 
 Rollout 记录表明，模型生成最终 `botmux send` 命令时，正文和 `--expected-link` 已经同时变成上述 base URL。发送记录也只收到并投递了这个 base URL。因此，本次问题不是 Botmux 或飞书在传输时截断 URL，而是参数在模型整理最终答案、重新书写来源链接时已经丢失。

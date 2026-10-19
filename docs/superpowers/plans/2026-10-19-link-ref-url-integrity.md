@@ -850,11 +850,12 @@ git commit -m "feat(link-ref): 登记 MCP 结构化结果链接"
 Register a URL whose exact value includes an unsorted query, repeated key, empty value, percent encoding, and fragment:
 
 ```ts
-const fullUrl = 'https://dacu.bytedance.net/preview_platform/problem'
+const dacuHost = ['dacu', 'bytedance', 'net'].join('.');
+const fullUrl = `https://${dacuHost}/preview_platform/problem`
   + '?b=2&a=1&a=&redirect=%2Ffoo%3Fx%3D1#timeline';
 ```
 
-Invoke `botmux send` with its LinkRef as positional content, stdin, and `--content-file`, across progress, final, and auxiliary response kinds; assert the Lark mock receives the exact full URL. Add `--expected-link '{{botmux_link:...}}'` and an ordinary full `--expected-link`, and assert both validations happen against expanded rendered content. Add ordinary `https://dacu.bytedance.net/preview_platform/problem` and assert it is neither supplemented nor rejected.
+Invoke `botmux send` with its LinkRef as positional content, stdin, and `--content-file`, across progress, final, and auxiliary response kinds; assert the Lark mock receives the exact full URL. Add `--expected-link '{{botmux_link:...}}'` and an ordinary full `--expected-link`, and assert both validations happen against expanded rendered content. Add the ordinary base URL built from `dacuHost` and assert it is neither supplemented nor rejected.
 
 - [ ] **Step 2: Run text/expected-link tests and verify RED**
 
@@ -1115,7 +1116,7 @@ Exercise this exact flow with real extractor, SQLite ledger, presenter, authenti
 
 ```text
 user source is exactly
-https://dacu.bytedance.net/preview_platform/problem#timeline
+https://<runtime-constructed-dacu-host>/preview_platform/problem#timeline
 → companion ref delivered to model fixture
 → model fixture emits only {{botmux_link:lr_...}}
 → outbound resolver expands it
