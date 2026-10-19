@@ -12,23 +12,26 @@ export function renderLinkRefCompanion(refs: readonly RegisteredLinkRef[]): stri
   return lines.join('\n');
 }
 
-export function appendToolLinkRefCompanion<T extends { content?: unknown[] }>(
+export function appendToolLinkRefCompanion<T extends object>(
   value: T,
-  refs: readonly RegisteredLinkRef[],
+  refs: readonly RegisteredLinkRef[] | string,
 ): T {
-  const companion = renderLinkRefCompanion(refs);
+  const companion = typeof refs === 'string' ? refs : renderLinkRefCompanion(refs);
   if (!companion) return value;
+  const content = 'content' in value && Array.isArray(value.content)
+    ? value.content
+    : [];
   return {
     ...value,
-    content: [...(value.content ?? []), { type: 'text', text: companion }],
+    content: [...content, { type: 'text', text: companion }],
   };
 }
 
 export function appendResourceLinkRefCompanion<T extends { contents?: unknown[] }>(
   value: T,
-  refs: readonly RegisteredLinkRef[],
+  refs: readonly RegisteredLinkRef[] | string,
 ): T {
-  const companion = renderLinkRefCompanion(refs);
+  const companion = typeof refs === 'string' ? refs : renderLinkRefCompanion(refs);
   if (!companion) return value;
   return {
     ...value,

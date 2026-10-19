@@ -186,13 +186,21 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
-import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
+import type {
+  GatewayLinkRefRegistrationHandler,
+  GatewayTrustedResultDeliveryHandler,
+} from './core/plugins/mcp/gateway.js';
 import {
   awaitTrustedResultDeliveryAck,
   consumeTrustedResultDeliverySources,
+  resolveTrustedResultDeliveryLinkRefs,
   sendTrustedDeliveryIpcWithBackpressure,
   trustedResultTerminalObservation,
 } from './core/plugins/mcp/trusted-result-delivery.js';
+import {
+  LINK_REF_REGISTER_MAX_BODY_BYTES,
+  LINK_REF_RESOLVE_MAX_BODY_BYTES,
+} from './core/link-ref-ipc.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import {
   readSessionMcpRuntimeManifest,
@@ -1679,6 +1687,82 @@ const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
 }>();
+const pendingLinkRefRegistrations = new Map<string, {
+  resolve: (value: { companion?: string; stats: Record<string, number | undefined> }) => void;
+  reject: (error: Error) => void;
+}>();
+const pendingLinkRefResolutions = new Map<string, {
+  resolve: (value: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs) => void;
+  reject: (error: Error) => void;
+}>();
+
+function assertBoundedLinkRefIpcValue(value: unknown, maxBytes: number): void {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error('link_ref_limit_exceeded');
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > maxBytes) {
+    throw new Error('link_ref_limit_exceeded');
+  }
+}
+
+const registerMcpLinkRefsThroughHost: GatewayLinkRefRegistrationHandler = async input => {
+  const { identity } = input;
+  if (!identity.turnId || !identity.linkRefMode) throw new Error('link_ref_identity_mismatch');
+  assertBoundedLinkRefIpcValue(input.value, LINK_REF_REGISTER_MAX_BODY_BYTES);
+  const requestId = randomUUID();
+  const result = new Promise<{ companion?: string; stats: Record<string, number | undefined> }>(
+    (resolve, reject) => pendingLinkRefRegistrations.set(requestId, { resolve, reject }),
+  );
+  send({
+    type: 'link_ref_register',
+    requestId,
+    sessionId,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    linkRefMode: identity.linkRefMode,
+    pluginId: input.pluginId,
+    sourceId: input.sourceId,
+    value: input.value,
+  });
+  try {
+    return await result;
+  } finally {
+    pendingLinkRefRegistrations.delete(requestId);
+  }
+};
+
+async function resolveMcpLinkRefsThroughHost(input: {
+  identity: NonNullable<ReturnType<typeof currentGatewayTrustedTurnIdentity>>;
+  payload: import('./services/link-ref-resolver.js').OutboundLinkRefPayload;
+}): Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs> {
+  if (!input.identity.turnId || input.identity.linkRefMode !== 'enabled') {
+    return { ...input.payload, refCount: 0 };
+  }
+  assertBoundedLinkRefIpcValue(input.payload, LINK_REF_RESOLVE_MAX_BODY_BYTES);
+  const requestId = randomUUID();
+  const result = new Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs>(
+    (resolve, reject) => pendingLinkRefResolutions.set(requestId, { resolve, reject }),
+  );
+  send({
+    type: 'link_ref_resolve',
+    requestId,
+    sessionId,
+    turnId: input.identity.turnId,
+    ...(input.identity.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.identity.dispatchAttempt }
+      : {}),
+    linkRefMode: 'enabled',
+    payload: input.payload,
+  });
+  try {
+    return await result;
+  } finally {
+    pendingLinkRefResolutions.delete(requestId);
+  }
+}
 
 const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
   const { identity, delivery } = input;
@@ -1687,15 +1771,27 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     throw new Error('plugin_result_delivery_missing_identity');
   }
   const artifactStore = new PluginResultArtifactStore();
-  const artifact = artifactStore.create({
-    pluginId: input.pluginId,
+  let artifact!: ReturnType<PluginResultArtifactStore['create']>;
+  const resolvedDelivery = await resolveTrustedResultDeliveryLinkRefs({
     delivery,
-    ownerUnionId: identity.caller.requestUserUnionId,
-    ...(identity.caller.requestUserOpenId ? { ownerOpenId: identity.caller.requestUserOpenId } : {}),
-    larkAppId: cfg.larkAppId,
-    sessionId,
-    turnId: identity.turnId,
-    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    mode: identity.linkRefMode ?? 'disabled',
+    resolve: payload => resolveMcpLinkRefsThroughHost({ identity, payload }),
+    persist: value => {
+      artifact = artifactStore.create({
+        pluginId: input.pluginId,
+        delivery: value,
+        ownerUnionId: identity.caller!.requestUserUnionId!,
+        ...(identity.caller!.requestUserOpenId
+          ? { ownerOpenId: identity.caller!.requestUserOpenId }
+          : {}),
+        larkAppId: cfg.larkAppId,
+        sessionId,
+        turnId: identity.turnId!,
+        ...(identity.dispatchAttempt !== undefined
+          ? { dispatchAttempt: identity.dispatchAttempt }
+          : {}),
+      });
+    },
   });
   const requestId = randomUUID();
   let resolveResponse!: (value: { messageIds: string[] }) => void;
@@ -1717,11 +1813,11 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
     ...(identity.caller?.requestUserOpenId ? { callerOpenId: identity.caller.requestUserOpenId } : {}),
     callerUnionId: identity.caller!.requestUserUnionId!,
-    deliveryId: delivery.deliveryId,
+    deliveryId: resolvedDelivery.deliveryId,
     viewToken: artifact.viewToken,
     expiresAt: artifact.expiresAt,
     fileCount: artifact.fileCount,
-    responseKind: delivery.responseKind ?? 'final',
+    responseKind: resolvedDelivery.responseKind ?? 'final',
   };
   try {
     await sendTrustedDeliveryIpcWithBackpressure({
@@ -1745,14 +1841,14 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     pendingPluginResultDeliveries.delete(requestId);
   });
   try {
-    consumeTrustedResultDeliverySources(delivery);
+    consumeTrustedResultDeliverySources(resolvedDelivery);
   } catch (error) {
     // The host snapshot and entry card are already durable. Cleanup failure
     // must not turn a working result into a broken link; retain the source for
     // operator cleanup and keep it out of the model-facing receipt.
     log(`[plugin-result] source cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if ((delivery.responseKind ?? 'final') === 'final') {
+  if ((resolvedDelivery.responseKind ?? 'final') === 'final') {
     const terminal = trustedResultTerminalObservation(response.messageIds);
     send({
       type: 'explicit_reply_observed',
@@ -1764,8 +1860,8 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
   }
   return {
     delivered: true as const,
-    deliveryId: delivery.deliveryId,
-    fileCount: delivery.files?.length ?? 0,
+    deliveryId: resolvedDelivery.deliveryId,
+    fileCount: resolvedDelivery.files?.length ?? 0,
   };
 };
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
@@ -1954,6 +2050,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
+    linkRefRegistration: registerMcpLinkRefsThroughHost,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -3716,7 +3813,11 @@ function releaseActiveTurnAuthority(
 }
 
 function currentGatewayTrustedTurnIdentity() {
-  return activeTurnAuthority.identity();
+  const identity = activeTurnAuthority.identity();
+  return {
+    ...identity,
+    ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
+  };
 }
 
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
@@ -23930,6 +24031,25 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'link_ref_register_result': {
+      const pending = pendingLinkRefRegistrations.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefRegistrations.delete(msg.requestId);
+      if (msg.ok) pending.resolve({
+        ...(msg.companion ? { companion: msg.companion } : {}),
+        stats: msg.stats ?? {},
+      });
+      else pending.reject(new Error(msg.error ?? 'link_ref_ledger_unavailable'));
+      break;
+    }
+    case 'link_ref_resolve_result': {
+      const pending = pendingLinkRefResolutions.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefResolutions.delete(msg.requestId);
+      if (msg.ok && msg.payload) pending.resolve(msg.payload);
+      else pending.reject(new Error(msg.error ?? 'link_ref_ledger_unavailable'));
+      break;
+    }
     case 'plugin_result_delivery_result': {
       const pending = pendingPluginResultDeliveries.get(msg.requestId);
       if (!pending) break;

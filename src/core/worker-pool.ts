@@ -162,6 +162,10 @@ import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
 import { prepareLinkRefTurnPayload } from './link-ref-turn.js';
 import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
 import type { LinkRefMode } from '../services/link-ref-types.js';
+import {
+  registerMcpLinkRefsFromWorker,
+  resolveMcpHostDeliveryLinkRefsFromWorker,
+} from './link-ref-ipc.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
@@ -14494,6 +14498,48 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'link_ref_register': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? registerMcpLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_register_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
+      case 'link_ref_resolve': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? resolveMcpHostDeliveryLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_resolve_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
       case 'active_turn_envelope_changed':
         inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
         break;

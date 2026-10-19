@@ -4,8 +4,138 @@ import type {
   LinkRefSourceInput,
   LinkRefSourceType,
 } from '../services/link-ref-types.js';
+import type { LinkRefRuntime } from '../services/link-ref-runtime.js';
+import type {
+  OutboundLinkRefPayload,
+  ResolvedOutboundLinkRefs,
+} from '../services/link-ref-resolver.js';
 
 export const LINK_REF_REGISTER_MAX_BODY_BYTES = 1024 * 1024;
+export const LINK_REF_RESOLVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+export interface McpLinkRefRegistrationRequest {
+  sessionId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+  linkRefMode: 'observe' | 'enabled';
+  pluginId: string;
+  sourceId: string;
+  value: unknown;
+}
+
+export interface McpHostDeliveryLinkRefRequest {
+  sessionId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+  linkRefMode: 'enabled';
+  payload: OutboundLinkRefPayload;
+}
+
+interface LinkRefDaemonSessionIdentity {
+  appId: string;
+  sessionId: string;
+  managedTurnOrigin?: {
+    turnId?: string;
+    dispatchAttempt?: number;
+    linkRefMode?: 'observe' | 'enabled';
+  };
+}
+
+function exactMcpTurnKey(
+  daemonSession: LinkRefDaemonSessionIdentity,
+  request: Pick<McpLinkRefRegistrationRequest, 'sessionId' | 'turnId' | 'dispatchAttempt'>,
+) {
+  return {
+    appId: daemonSession.appId,
+    sessionId: request.sessionId,
+    turnId: request.turnId,
+    ...(request.dispatchAttempt !== undefined
+      ? { dispatchAttempt: request.dispatchAttempt }
+      : {}),
+  };
+}
+
+function boundedJsonValue(value: unknown, maxBytes: number): boolean {
+  try {
+    const encoded = JSON.stringify(value);
+    return encoded !== undefined && Buffer.byteLength(encoded, 'utf8') <= maxBytes;
+  } catch {
+    return false;
+  }
+}
+
+function stableLinkRefError(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = String((error as { code: unknown }).code);
+    if (code.startsWith('link_ref_') || code === 'expected_link_invalid_after_link_ref') return code;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('link_ref_') ? message : 'link_ref_ledger_unavailable';
+}
+
+export function registerMcpLinkRefsFromWorker(input: {
+  ownsWorkerSession: boolean;
+  daemonSession: LinkRefDaemonSessionIdentity;
+  runtime: LinkRefRuntime;
+  request: McpLinkRefRegistrationRequest;
+}): ({ ok: true; companion?: string; stats: LinkRefExtractionStats }
+  | { ok: false; error: string }) {
+  const { request, daemonSession } = input;
+  if (!input.ownsWorkerSession
+    || request.sessionId !== daemonSession.sessionId
+    || !request.turnId
+    || !request.pluginId
+    || !request.sourceId
+    || !boundedJsonValue(request.value, LINK_REF_REGISTER_MAX_BODY_BYTES)) {
+    return { ok: false, error: 'link_ref_identity_mismatch' };
+  }
+  const key = exactMcpTurnKey(daemonSession, request);
+  if (request.linkRefMode === 'enabled' && input.runtime.restoreMode(key) !== 'enabled') {
+    return { ok: false, error: 'link_ref_turn_not_open' };
+  }
+  try {
+    const result = input.runtime.registerSources({
+      key,
+      mode: request.linkRefMode,
+      sources: [{
+        sourceType: 'mcp',
+        kind: 'structured',
+        sourceId: request.sourceId,
+        value: request.value,
+      }],
+    });
+    return { ok: true, ...result };
+  } catch (error) {
+    return { ok: false, error: stableLinkRefError(error) };
+  }
+}
+
+export function resolveMcpHostDeliveryLinkRefsFromWorker(input: {
+  ownsWorkerSession: boolean;
+  daemonSession: LinkRefDaemonSessionIdentity;
+  runtime: LinkRefRuntime;
+  request: McpHostDeliveryLinkRefRequest;
+}): ({ ok: true; payload: ResolvedOutboundLinkRefs } | { ok: false; error: string }) {
+  const { request, daemonSession } = input;
+  if (!input.ownsWorkerSession
+    || request.sessionId !== daemonSession.sessionId
+    || !request.turnId
+    || !boundedJsonValue(request.payload, LINK_REF_RESOLVE_MAX_BODY_BYTES)) {
+    return { ok: false, error: 'link_ref_identity_mismatch' };
+  }
+  const key = exactMcpTurnKey(daemonSession, request);
+  if (input.runtime.restoreMode(key) !== 'enabled') {
+    return { ok: false, error: 'link_ref_turn_not_open' };
+  }
+  try {
+    return {
+      ok: true,
+      payload: input.runtime.resolveForDaemon(key, 'enabled', request.payload),
+    };
+  } catch (error) {
+    return { ok: false, error: stableLinkRefError(error) };
+  }
+}
 
 const REGISTER_BODY_KEYS = new Set([
   'sourceType',
