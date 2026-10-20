@@ -272,7 +272,10 @@ describe('worker pipe initial screen ordering', () => {
 
   it('defers idle detected during ready-gate settle so the first prompt still flushes', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const markStart = source.indexOf('function markPromptReady');
+    // Exact signature: the bare prefix also matches the earlier
+    // markPromptReadyFromPty, and the slice would then swallow the helpers in
+    // between (e.g. settleRestartAttemptOnReady's own prompt_ready send).
+    const markStart = source.indexOf('function markPromptReady(): void');
     const markEnd = source.indexOf('function persistCliSessionId', markStart);
     const mark = source.slice(markStart, markEnd);
     const settleStart = source.indexOf('function settleThenFlush');
@@ -332,7 +335,10 @@ describe('worker pipe initial screen ordering', () => {
 
   it('rejects Codex App prompts before proof and while the explicit queue is active', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const markStart = source.indexOf('function markPromptReady');
+    // Exact signature: the bare prefix also matches the earlier
+    // markPromptReadyFromPty, and the slice would then swallow the helpers in
+    // between (e.g. settleRestartAttemptOnReady's own prompt_ready send).
+    const markStart = source.indexOf('function markPromptReady(): void');
     const markEnd = source.indexOf('function persistCliSessionId', markStart);
     const mark = source.slice(markStart, markEnd);
 

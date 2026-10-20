@@ -197,18 +197,18 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
 describe('every daemon-side restart IPC producer carries model (source wiring)', () => {
   it('worker-pool.ts: every {type:restart} send includes model', () => {
     const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2); // requestSessionRestart + auto-restart
+    // requestSessionRestart 是唯一发送方（#1863）：CLI 崩溃自动重启 / dashboard 重启 /
+    // cwd-move 都经它走，自然捎带 model。
+    expect(sends.length).toBe(1);
     for (const s of sends) {
       expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
     }
   });
 
-  it('dashboard-ipc-server.ts: every {type:restart} send includes model', () => {
+  it('dashboard-ipc-server.ts: sends no restart IPC itself — delegates to requestSessionRestart', () => {
     const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard 重启按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
-    }
+    expect(sends.length).toBe(0); // dashboard 重启按钮 + cwd-move 均改走 requestSessionRestart
+    expect(dashboardIpcSource.match(/requestSessionRestart\(ds,/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 
   it('the restart message type declares the three-state model field', () => {

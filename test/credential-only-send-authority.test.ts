@@ -545,10 +545,15 @@ describe('worker wiring for the credential-only relay', () => {
 
   it('cold-spawns instead of reattaching a credential-only pane whose outbox is gone', () => {
     expect(source).toContain(
-      'const isolationMarkerReattachSafe = isolationMarkerMatches && credentialOnlyRelayReattachable;',
+      'const isolationMarkerReattachSafe = isolationMarkerMatches && paneRelayReattachable;',
     );
-    const gateAt = source.indexOf('const credentialOnlyRelayReattachable = !credentialOnlyBwrap');
-    expect(gateAt).toBeGreaterThanOrEqual(0);
+    // One gate for every Linux pane whose relay is bound by inode; the
+    // credential-only flavour is one of its arms.
+    const boundAt = source.indexOf('const paneRelayBoundByInode = process.platform === \'linux\'');
+    expect(boundAt).toBeGreaterThanOrEqual(0);
+    expect(source.slice(boundAt, source.indexOf(';', boundAt))).toContain('credentialOnlyBwrap');
+    const gateAt = source.indexOf('const paneRelayReattachable = !paneRelayBoundByInode');
+    expect(gateAt).toBeGreaterThan(boundAt);
     expect(source.indexOf('attachCredentialOnlyRelayOutbox({', gateAt)).toBeGreaterThan(gateAt);
   });
 

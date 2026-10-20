@@ -43,26 +43,35 @@ describe('every daemon-side restart IPC producer carries larkToolBinding', () =>
 
   it('worker-pool.ts: every {type:restart} send includes larkToolBinding', () => {
     const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2);
+    expect(sends.length).toBe(1); // requestSessionRestart — the single sender (#1863)
     for (const s of sends) {
       expect(s).toContain('larkToolBinding: latestLarkToolBindingForRespawn(ds)');
     }
   });
 
-  it('dashboard-ipc-server.ts: every {type:restart} send includes larkToolBinding', () => {
+  it('dashboard-ipc-server.ts: sends no restart IPC itself — delegates to requestSessionRestart', () => {
     const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2);
-    for (const s of sends) {
-      expect(s).toContain('larkToolBinding: latestLarkToolBindingForRespawn(ds)');
-    }
+    expect(sends.length).toBe(0);
+    expect(dashboardIpcSource.match(/requestSessionRestart\(ds,/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 
-  it('covers all >= 4 restart senders across worker-pool and dashboard-ipc-server', () => {
-    const poolSends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    const ipcSends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(poolSends.length).toBeGreaterThanOrEqual(2);
-    expect(ipcSends.length).toBeGreaterThanOrEqual(2);
-    expect(poolSends.length + ipcSends.length).toBeGreaterThanOrEqual(4);
+  it('every daemon-side restart sender funnels through requestSessionRestart (attemptId-correlated)', () => {
+    // #1863: a restart IPC without attemptId gets no restart_result, so the
+    // workerReady fence it lowers never lifts. IM /restart, card button,
+    // dashboard restart, cwd-move and cli_crash auto-restart all share the one
+    // coordinator-backed sender; any new bare sender outside it fails here.
+    const fn = workerPoolSource.indexOf('export function requestSessionRestart');
+    const end = workerPoolSource.indexOf('\n}\n', fn);
+    expect(fn).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(fn);
+    const poolSends = [...workerPoolSource.matchAll(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g)];
+    expect(poolSends.length).toBe(1);
+    for (const m of poolSends) {
+      expect(m.index!, `restart IPC sent outside requestSessionRestart: ${m[0]}`).toBeGreaterThan(fn);
+      expect(m.index!, `restart IPC sent outside requestSessionRestart: ${m[0]}`).toBeLessThan(end);
+      expect(m[0]).toContain('attemptId');
+    }
+    expect(dashboardIpcSource).not.toMatch(/type: 'restart'/);
   });
 
   it('types.ts: declares larkToolBinding in restart and message messages', () => {

@@ -1,3 +1,4 @@
+import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -30,6 +31,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
@@ -195,42 +197,20 @@ export function configureLarkClientHttpTimeout(client: unknown): void {
  * behave identically. Falls back to leaving the client on the shared instance
  * if the SDK ever stops exporting `defaultHttpInstance`, so a future SDK bump
  * degrades to "uploads keep the interactive timeout" rather than breaking.
+ *
+ * The pool additionally carries dedicated short-TTL keep-alive agents (see
+ * utils/lark-http-pool.ts): without them a large upload over a lossy path can
+ * land on a socket an intermediary silently half-closed, write its whole body,
+ * then never receive a response — wedging every later upload on that pool.
  */
-let cachedLarkUploadHttpInstance: unknown;
+let cachedLarkUploadHttpPool: { instance: unknown } | null | undefined;
 export function larkUploadHttpInstance(): unknown {
-  if (cachedLarkUploadHttpInstance !== undefined) return cachedLarkUploadHttpInstance;
-  let base: any;
-  try {
-    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
-  } catch {
-    // A stripped/mocked SDK namespace may throw on accessing an absent export.
-    base = undefined;
-  }
-  if (!base || typeof base.create !== 'function') {
-    cachedLarkUploadHttpInstance = null;
-    return cachedLarkUploadHttpInstance;
-  }
-  const instance = base.create({ timeout: LARK_UPLOAD_TIMEOUT_MS });
-  try {
-    for (const handler of base.interceptors?.request?.handlers ?? []) {
-      if (handler) {
-        instance.interceptors.request.use(handler.fulfilled, handler.rejected, {
-          synchronous: handler.synchronous,
-        });
-      }
-    }
-    for (const handler of base.interceptors?.response?.handlers ?? []) {
-      if (handler) instance.interceptors.response.use(handler.fulfilled, handler.rejected);
-    }
-  } catch {
-    // A shape change in the SDK's interceptor registry must not brick uploads;
-    // an instance without the response-unwrap interceptor would misread
-    // responses, so fall back to the shared instance (interactive timeout).
-    cachedLarkUploadHttpInstance = null;
-    return cachedLarkUploadHttpInstance;
-  }
-  cachedLarkUploadHttpInstance = instance;
-  return cachedLarkUploadHttpInstance;
+  if (cachedLarkUploadHttpPool !== undefined) return cachedLarkUploadHttpPool?.instance ?? null;
+  cachedLarkUploadHttpPool = createLarkUploadHttpPool(
+    Lark as unknown as { defaultHttpInstance?: any },
+    { timeoutMs: LARK_UPLOAD_TIMEOUT_MS },
+  );
+  return cachedLarkUploadHttpPool?.instance ?? null;
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
@@ -1600,6 +1580,11 @@ export interface BotConfig {
   /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
    * admitted task may inject up to two recovery inputs into native history. */
   codexCapacityRecovery?: boolean;
+  /** Experimental, off by default. When true, a structured-bridge failure
+   * notice is not posted if this exact turn/attempt already delivered an
+   * acknowledged explicit final. It trusts that final and does not compare it
+   * with later transcript text. Missing/false keeps the legacy notice. */
+  suppressDeliveredFinalFailureNotice?: boolean;
   /**
    * Codex App only: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
@@ -2068,7 +2053,7 @@ export interface BotConfig {
   skills?: BotSkillPolicy;
   /**
    * Custom footer brand label for cards this bot sends. Three states:
-   *   • `undefined` (unset)  → default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`
+   *   • `undefined` (unset)  → default `[botmux](github)` link
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
    *   • any other string     → rendered verbatim (markdown allowed)
    * Resolved via {@link resolveBrandLabel}. Pure cosmetic — does not affect
@@ -2102,6 +2087,13 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  replyFooterEnabled?: boolean;
+  replyFooterBrand?: boolean;
+  replyFooterModel?: boolean;
+  replyFooterUsage?: boolean;
+  replyFooterRecipients?: boolean;
+  replyFooterVoice?: boolean;
+
   /** Show per-turn waiting and native execution time on final reply cards. Default off. */
   showReplyTiming?: boolean;
   tuiSlashAllow?: string[];
@@ -2433,7 +2425,7 @@ export function __testOnly_resetBotRegistry(): void {
   registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
-  cachedLarkUploadHttpInstance = undefined;
+  cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
   replyStyleCache = null;
 }
@@ -3937,6 +3929,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         }
       })(),
       codexCapacityRecovery: entry.codexCapacityRecovery === true || undefined,
+      suppressDeliveredFinalFailureNotice: entry.suppressDeliveredFinalFailureNotice === true || undefined,
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined
@@ -4125,6 +4118,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
@@ -4293,4 +4287,24 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
  */
 export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
   return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
+}
+
+/** Live registry first, disk second, own-bot spawn snapshot for isolated sends. */
+export function resolveReplyFooterPreferences(larkAppId: string): ReplyFooterPreferences {
+  const registered = bots.get(larkAppId);
+  if (registered) return normalizeReplyFooter(registered.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const entries = JSON.parse(readFileSync(path, 'utf-8'));
+      if (Array.isArray(entries)) {
+        const entry = entries.find(e => e?.larkAppId === larkAppId);
+        if (entry) return normalizeReplyFooter(entry);
+      }
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId) {
+    return parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER);
+  }
+  return {};
 }

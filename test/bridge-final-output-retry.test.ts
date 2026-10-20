@@ -60,6 +60,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildSessionCard: vi.fn(() => '{}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
+  buildTurnFailedCard: vi.fn((opts: { mentionOpenId?: string }) => JSON.stringify({ turnFailed: true, mentionOpenId: opts.mentionOpenId })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -145,6 +146,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   getDaemonReplyCardUsageSnapshot,
+  getDaemonReplyCardRenderSnapshot,
   initWorkerPool,
   postTurnStartingCard,
   pruneSteerFanoutState,
@@ -172,7 +174,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getBotClient, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getBotClient, getOwnerOpenId, resolveBrandLabel, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
@@ -461,6 +463,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
     expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
     expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
+  });
+
+  describe.each(['claude-code', 'codex'] as const)('%s adopt_preamble footer controls', cliId => {
+    it.each([
+      { name: 'default enabled', preferences: {}, brand: true, model: true, usage: true, recipients: true },
+      { name: 'master disabled with enabled blocks', preferences: { replyFooterEnabled: false, replyFooterBrand: true, replyFooterModel: true, replyFooterUsage: true, replyFooterRecipients: true }, brand: false, model: false, usage: false, recipients: false },
+      { name: 'brand disabled', preferences: { replyFooterBrand: false }, brand: false, model: true, usage: true, recipients: true },
+      { name: 'model disabled', preferences: { replyFooterModel: false }, brand: true, model: false, usage: true, recipients: true },
+      { name: 'usage disabled', preferences: { replyFooterUsage: false }, brand: true, model: true, usage: false, recipients: true },
+      { name: 'recipients disabled', preferences: { replyFooterRecipients: false }, brand: true, model: true, usage: true, recipients: false },
+      { name: 'all available blocks disabled', preferences: { replyFooterBrand: false, replyFooterModel: false, replyFooterUsage: false, replyFooterRecipients: false }, brand: false, model: false, usage: false, recipients: false },
+    ])('respects $name without changing the quoted exchange', async scenario => {
+      const bot = getBot('app_test');
+      Object.assign(bot.config, scenario.preferences);
+      vi.mocked(resolveBrandLabel).mockReturnValueOnce('adopt-footer-brand');
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = 'ou_adopt_owner';
+      if (!ds.worker) throw new Error('Missing fixture worker');
+      __testOnly_setupWorkerHandlers(ds, ds.worker);
+      ds.activeModel = 'adopt-footer-model';
+      ds.activeReasoningEffort = 'high';
+      ds.worker.emit('message', {
+        type: 'adopt_preamble', turnId: 'turn-adopt',
+        userText: 'Previous user request', assistantText: 'Previous assistant answer',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      const card = JSON.parse(sessionReply.mock.calls[0][1]);
+      const footer = card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+      const content = footer?.content ?? '';
+      expect(content.includes('adopt-footer-brand')).toBe(scenario.brand);
+      expect(content.includes('adopt-footer-model')).toBe(scenario.model);
+      expect(content.includes('12%')).toBe(scenario.usage);
+      expect(content.includes('<at id=ou_adopt_owner></at>')).toBe(scenario.recipients);
+      const hasFooter = scenario.brand || scenario.model || scenario.usage || scenario.recipients;
+      expect(Boolean(footer)).toBe(hasFooter);
+      // The contextual body always separates the user and assistant with one divider.
+      expect(card.body.elements.filter((element: any) => element.tag === 'hr')).toHaveLength(hasFooter ? 2 : 1);
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous user request');
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous assistant answer');
+      // Rendering must preserve saved block choices when the master is off.
+      expect(bot.config).toMatchObject(scenario.preferences);
+    });
   });
 
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
@@ -2951,6 +2999,151 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_orch_bot></at>');
   });
 
+  describe('in a topic opened by botmux dispatch', () => {
+    // The dispatcher already gets the result through `botmux report
+    // --dispatch-root`; an @ in the sub-topic only starts a fresh dispatcher
+    // session there without the dispatch context (#1887).
+    async function bindTopicToDispatcher(tamper = false): Promise<void> {
+      vi.stubEnv('BOTMUX_CORE_ONLY', '1');
+      const { createDispatchReportBinding, loadOrCreateDispatchReportBindingSecret } = await import('../src/core/dispatch-report-binding.js');
+      const reportBinding = createDispatchReportBinding(loadOrCreateDispatchReportBindingSecret(config.session.dataDir), {
+        dispatchRoot: 'om_root', targetLarkAppId: 'cli_orchestrator', targetSessionId: 'session-orchestrator',
+        targetChatId: 'oc_chat', targetScope: 'chat', sourceName: 'review', issuedAt: '2026-10-18T00:00:00.000Z',
+      });
+      if (tamper) reportBinding.signature = 'forged';
+      writeFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding } }));
+    }
+
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    async function deliverDispatchedFinal(ds: DaemonSession): Promise<string> {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      return String(sessionReply.mock.calls[0][1]);
+    }
+
+    function dispatchedRunnerDs(cliId: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = undefined;
+      ds.ownerOpenId = undefined;
+      ds.session.creatorOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      return ds;
+    }
+
+    it.each(['mira', 'mir', 'dsh'] as const)('does not address %s fallback output to the dispatcher', async (cliId) => {
+      await bindTopicToDispatcher();
+      const card = await deliverDispatchedFinal(dispatchedRunnerDs(cliId));
+      expect(card).toContain('final answer');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('does not address a known-bot owner either (/repo-primed dispatch)', async () => {
+      await bindTopicToDispatcher();
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({ Orchestrator: 'ou_orch_bot' }));
+      const ds = dispatchedRunnerDs('mira');
+      ds.session.ownerOpenId = 'ou_orch_bot';
+      ds.ownerOpenId = 'ou_orch_bot';
+      expect(await deliverDispatchedFinal(ds)).not.toContain('ou_orch_bot');
+    });
+
+    it('still @mentions the bot admin when the dispatched turn failed', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(dispatchedRunnerDs('dsh'), { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('addresses the ambiguous-terminal failure card to the bot admin, not the dispatcher', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_card');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = dispatchedRunnerDs('dsh');
+      ds.adoptedFrom = undefined;
+      const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'turn-1', status: 'ambiguous' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
+    });
+
+    it('lets a zero-prompt CLI report to the dispatcher instead of @-ing it', async () => {
+      await bindTopicToDispatcher();
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('falls back to the bot admin for a failed zero-prompt turn in a dispatched topic', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, onZeroPromptFinal: vi.fn(async () => {}), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('keeps the zero-prompt @ and skips the report when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_dispatcher_bot></at>');
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+    });
+
+    it('keeps addressing the dispatcher when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      expect(await deliverDispatchedFinal(dispatchedRunnerDs('dsh'))).toContain('<at id=ou_dispatcher_bot></at>');
+    });
+  });
+
   it('keeps daemon final-output footer addressing for a human owner', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -4025,6 +4218,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       if (previousSessionDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = previousSessionDataDir;
       rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('observes native starts per worker generation and exact dispatch attempt', async () => {
+    const bot = getBot('app_test');
+    bot.config.showReplyTiming = true;
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    ds.turnReceivedAtMs = new Map([['turn-observed', Date.now() - 6000]]);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 4000 });
+    await vi.advanceTimersByTimeAsync(0);
+    const snapshot = getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' });
+    expect(snapshot.timing).toEqual({ executionDurationMs: 4000, waitingDurationMs: 2000, executionInProgress: true });
+    expect(snapshot.footerPreferences.replyFooterEnabled).toBe(false);
+    expect(snapshot.usage).not.toHaveProperty('replyFooter');
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'other' }).timing).toBeUndefined();
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed', dispatchAttempt: 2 }).timing).toBeUndefined();
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1; ds.session.workerGeneration = ds.workerGeneration;
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 1000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' }).timing).toBeUndefined();
+  });
+
+  it('freezes timing and its display setting across final reply retries', async () => {
+    const bot = getBot('app_test'); bot.config.showReplyTiming = true;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.turnReceivedAtMs = new Map([['turn-1', Date.now() - 7000]]);
+    const msg = { ...finalOutputMsg(), durationMs: 5000, executionStartedAtMs: Date.now() - 5000 };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    bot.config.showReplyTiming = false;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('5.0');
+    expect(sessionReply.mock.calls[0][1]).toContain('2.0');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('keeps the entire footer hidden across daemon final-output retries', async () => {
+    const bot = getBot('app_test');
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // A retry must use the first render policy, even if settings later change.
+    bot.config.replyFooterEnabled = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).not.toContain('botmux_reply_footer');
+      expect(call[1]).not.toContain('observed-model');
+      expect(call[1]).not.toContain('"tag":"hr"');
     }
   });
 
