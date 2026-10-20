@@ -850,7 +850,7 @@ git commit -m "feat(link-ref): 登记 MCP 结构化结果链接"
 Register a URL whose exact value includes an unsorted query, repeated key, empty value, percent encoding, and fragment:
 
 ```ts
-const dacuHost = ['dacu', 'bytedance', 'net'].join('.');
+const dacuHost = 'source.example.test';
 const fullUrl = `https://${dacuHost}/preview_platform/problem`
   + '?b=2&a=1&a=&redirect=%2Ffoo%3Fx%3D1#timeline';
 ```
