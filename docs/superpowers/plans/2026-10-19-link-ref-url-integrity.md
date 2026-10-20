@@ -1116,7 +1116,7 @@ Exercise this exact flow with real extractor, SQLite ledger, presenter, authenti
 
 ```text
 user source is exactly
-https://<runtime-constructed-dacu-host>/preview_platform/problem#timeline
+https://<runtime-constructed source host>/preview_platform/problem#timeline
 → companion ref delivered to model fixture
 → model fixture emits only {{botmux_link:lr_...}}
 → outbound resolver expands it
@@ -1125,7 +1125,7 @@ https://<runtime-constructed-dacu-host>/preview_platform/problem#timeline
 → provider receives the exact original bytes once
 ```
 
-In the same test send the plain DACU base URL and assert it remains plain. Repeat with a bytecli-style authorization URL containing `code`, `token`, `signature`, `state`, and `redirect_uri`, and assert it remains usable; include a Bearer header and assert it never enters the ledger/companion/log.
+In the same test send the plain source base URL and assert it remains plain. Repeat with a bytecli-style authorization URL containing `code`, `token`, `signature`, `state`, and `redirect_uri`, and assert it remains usable; include a Bearer header and assert it never enters the ledger/companion/log.
 
 - [ ] **Step 2: Run the end-to-end test and verify GREEN**
 
