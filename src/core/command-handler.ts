@@ -1164,6 +1164,9 @@ async function applyAllowedUsersSet(
     return;
   }
   let msg = t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc);
+  if (r.unresolvedEmailsAndMobiles?.length) {
+    msg += '\n' + t('cmd.config.allow_warn_contacts', { items: r.unresolvedEmailsAndMobiles.join(', ') }, loc);
+  }
   if (r.unresolvedUnionIds?.length) {
     msg += '\n' + t('cmd.config.allow_warn_union', { items: r.unresolvedUnionIds.join(', ') }, loc);
   }

@@ -51,6 +51,7 @@ import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } fro
 import {
   advanceAncestorSessionTurn,
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
+  findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -5803,7 +5804,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'chat-manager' | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5811,7 +5812,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret) {
+  if (!hostSecret || route === 'chat-manager') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -5822,6 +5823,14 @@ async function postSessionCliIpc(
       requestBody.originCapability = claim.capability;
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
+    }
+    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+      const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
+      if (marker?.sessionId === sessionId && marker.capability) {
+        requestBody.originCapability = marker.capability;
+        requestBody.originTurnId = marker.turnId;
+        requestBody.originDispatchAttempt = marker.dispatchAttempt;
+      }
     }
   }
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
@@ -6199,6 +6208,27 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+async function cmdChatManager(argv: string[]): Promise<void> {
+  const action = argv[0];
+  if (argv.length !== 1 || !['set', 'clear', 'status'].includes(action)) {
+    console.error('用法: botmux manager set|clear|status');
+    process.exitCode = 2;
+    return;
+  }
+  const sid = findAncestorSessionContext()?.sessionId;
+  const session = sid ? [...loadSessions().values()].find(item => item.sessionId === sid) : undefined;
+  const daemon = session && findDaemon(session.larkAppId);
+  if (!session || !daemon) {
+    console.error(JSON.stringify({ ok: false, error: session ? 'daemon_offline' : 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager', { action });
+  const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  if (response.ok && body?.ok) console.log(JSON.stringify(body));
+  else { console.error(JSON.stringify(body)); process.exitCode = 1; }
 }
 
 const SESSION_RENAME_USAGE = '用法: botmux session rename "<标题>"（只改当前会话；会话自动识别，不接受 --session-id 等参数指定其他会话）';
@@ -7291,6 +7321,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
+  manager set|clear|status             设置、取消或查看当前群负责人（会话内使用）
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
 ${SEND_HELP_BODY}
   card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
@@ -18911,6 +18942,7 @@ switch (command) {
   case 'top-notice': await cmdTopNotice(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
+  case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

@@ -30,6 +30,7 @@ import {
   builtinSkillEntries,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  chatManagerEnabledForApp,
 } from '../skills/injection-mode.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
@@ -1398,7 +1399,12 @@ function buildNewTopicBlocks(
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
       // the catalog as a compact trigger for complex delivery and safety rules.
-      const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
+      const entries = builtinSkillEntries({
+        asksViaHook: adapter.asksViaHook,
+        whiteboardEnabled: whiteboardEnabled(),
+        chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
+        excludeRoutingCovered: true,
+      });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale);
