@@ -173,4 +173,53 @@ describe('botmux send LinkRef expansion', () => {
       expect(output.requests).toHaveLength(0);
     } finally { rmSync(output.root, { recursive: true, force: true }); }
   });
+
+  it('expands completion-proposal fields before a static fallback is rendered', () => {
+    const state = fixtureRoot();
+    const proposalPath = join(state.root, 'completion-proposal.json');
+    writeFileSync(proposalPath, JSON.stringify({
+      title: `继续处理 ${placeholder}`,
+      body: `授权入口：${placeholder}`,
+      acceptLabel: '继续',
+      dismissLabel: '结束',
+    }));
+    const result = spawnSyncTsScript(fixture, [
+      'send', '--no-mention', '--response-kind', 'final', '主回答',
+      '--completion-proposal-file', proposalPath,
+    ], {
+      cwd: repo,
+      env: {
+        PATH: process.env.PATH, HOME: state.root, SESSION_DATA_DIR: state.dataDir,
+        BOTS_CONFIG: join(state.root, 'bots.json'), BOTMUX_SESSION_ID: state.sessionId,
+        BOTMUX_TURN_ID: state.turnId, BOTMUX_LARK_APP_ID: 'cli_test',
+        BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_LINK_REF_ID: refId,
+        BOTMUX_TEST_LINK_REF_URL: fullUrl,
+      },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    try {
+      const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toContain(fullUrl);
+      expect(requests[0]).not.toContain(placeholder);
+    } finally { rmSync(state.root, { recursive: true, force: true }); }
+  });
+
+  it('expands LinkRefs in card patch JSON before the provider update', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: `授权：${placeholder}` }] },
+    };
+    const output = run({ args: [
+      'card', 'patch', '--message-id', 'om_existing', '--card-json', JSON.stringify(card),
+    ] });
+    try {
+      expect(output.result.status, String(output.result.stderr)).toBe(0);
+      expect(output.resolves).toHaveLength(1);
+      expect(output.requests).toHaveLength(1);
+      expect(output.requests[0]).toContain(fullUrl);
+      expect(output.requests[0]).not.toContain(placeholder);
+    } finally { rmSync(output.root, { recursive: true, force: true }); }
+  });
 });

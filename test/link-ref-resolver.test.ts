@@ -69,6 +69,19 @@ describe('LinkRef resolver', () => {
     expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
   });
 
+  it.each([
+    ['unclosed inline code on the same line', '`unfinished %s'],
+    ['unclosed inline code on an earlier line', '`unfinished\n%s'],
+    ['unclosed backtick fence', '```md\nunfinished\n%s'],
+    ['unclosed tilde fence', '~~~md\nunfinished\n%s'],
+  ])('does not let %s hide an outbound ref', (_label, template) => {
+    const refId = register('https://example.test/recovered');
+    const placeholder = `{{botmux_link:${refId}}}`;
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text: template.replace('%s', placeholder) }).text)
+      .toContain('https://example.test/recovered');
+  });
+
   it('deduplicates repeated refs into one ledger lookup', () => {
     const refId = register('https://example.test/p');
     const spy = vi.spyOn(ledger, 'resolveBatch');

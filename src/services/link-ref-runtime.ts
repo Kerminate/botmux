@@ -119,7 +119,6 @@ export function createLinkRefRuntime(
         return legacy;
       }
       const frozen: CliTurnPayload = { ...payload, linkRefs: { mode } };
-      if (sources.length === 0) return frozen;
       const result = runtime.registerSources({ key, mode, sources });
       if (mode !== 'enabled' || !result.companion) return frozen;
       const additionalContext = { ...frozen.codexAppInput?.additionalContext };
@@ -145,10 +144,10 @@ export function createLinkRefRuntime(
         });
         return { stats: extraction.stats };
       }
-      if (extraction.candidates.length === 0) return { stats: extraction.stats };
       try {
         const store = ledger();
         store.openTurn(key);
+        if (extraction.candidates.length === 0) return { stats: extraction.stats };
         const registration = store.registerBatch(key, extraction.candidates);
         recordDiagnostic({
           mode,

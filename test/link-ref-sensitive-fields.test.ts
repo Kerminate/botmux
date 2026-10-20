@@ -17,7 +17,7 @@ describe('collectLinkRefCandidates sensitive leaves', () => {
       },
       password: 'https://should-not-register.test/password',
       access_token: 'https://should-not-register.test/access',
-      clientSecret: 'https://should-register.test/not-an-exact-name',
+      clientSecret: 'https://should-not-register.test/client-secret',
       authorization: { url: 'https://auth.test/approve' },
       authorization_url: 'https://auth.test/login',
       documentation_url: 'https://docs.test/page',
@@ -27,7 +27,6 @@ describe('collectLinkRefCandidates sensitive leaves', () => {
         url: 'https://excluded.test/x',
       },
     })).toEqual([
-      'https://should-register.test/not-an-exact-name',
       'https://auth.test/approve',
       'https://auth.test/login',
       'https://docs.test/page',
@@ -37,13 +36,14 @@ describe('collectLinkRefCandidates sensitive leaves', () => {
 
   it('filters every specified exact credential field with hyphen/underscore and case equivalence', () => {
     const value = Object.fromEntries([
-      'password', 'passwd', 'secret', 'client_secret', 'access-token',
-      'refresh_token', 'ID_TOKEN', 'session-token', 'api_key', 'apikey', 'private-key',
+      'password', 'passwd', 'secret', 'client_secret', 'clientSecret', 'access-token', 'accessToken',
+      'refresh_token', 'refreshToken', 'ID_TOKEN', 'idToken', 'session-token', 'sessionToken',
+      'api_key', 'apiKey', 'apikey', 'private-key', 'privateKey',
     ].map((field, index) => [field, `https://secret.test/${index}`]));
     const result = collectLinkRefCandidates([{ sourceType: 'mcp', kind: 'structured', value }]);
 
     expect(result.candidates).toEqual([]);
-    expect(result.stats.filteredCredential).toBe(11);
+    expect(result.stats.filteredCredential).toBe(18);
   });
 
   it('filters auth-header-shaped scalars but recurses into authorization objects', () => {

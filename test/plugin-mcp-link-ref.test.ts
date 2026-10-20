@@ -219,7 +219,7 @@ describe('plugin MCP daemon LinkRef authority', () => {
     } as LinkRefRuntime;
   }
 
-  it('derives app identity from the current daemon session and accepts an open frozen turn', () => {
+  it('derives app identity from the current daemon session and accepts the exact live turn', () => {
     const linkRefs = runtime();
     const result = registerMcpLinkRefsFromWorker({
       ownsWorkerSession: true,
@@ -227,7 +227,8 @@ describe('plugin MCP daemon LinkRef authority', () => {
         appId: 'app-host-owned',
         sessionId: 'session-link-ref',
         managedTurnOrigin: {
-          turnId: 'om_newer_live_turn',
+          turnId: 'om_link_ref',
+          dispatchAttempt: 3,
           linkRefMode: 'enabled',
         },
       },
@@ -274,7 +275,7 @@ describe('plugin MCP daemon LinkRef authority', () => {
       daemonSession: {
         appId: 'app-host-owned',
         sessionId,
-        managedTurnOrigin: { turnId: 'om_link_ref', linkRefMode: 'enabled' },
+        managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'enabled' },
       },
       runtime: linkRefs,
       request,
@@ -283,11 +284,66 @@ describe('plugin MCP daemon LinkRef authority', () => {
     expect(registerSources).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['stale turn', { turnId: 'om_newer', dispatchAttempt: 3, linkRefMode: 'enabled' as const }],
+    ['stale attempt', { turnId: 'om_link_ref', dispatchAttempt: 4, linkRefMode: 'enabled' as const }],
+    ['wrong mode', { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'observe' as const }],
+    ['missing live origin', undefined],
+  ])('rejects %s instead of writing another open turn', (_label, managedTurnOrigin) => {
+    const linkRefs = runtime();
+    const result = registerMcpLinkRefsFromWorker({
+      ownsWorkerSession: true,
+      daemonSession: { appId: 'app-host-owned', sessionId: 'session-link-ref', managedTurnOrigin },
+      runtime: linkRefs,
+      request,
+    });
+
+    expect(result).toEqual({ ok: false, error: 'link_ref_identity_mismatch' });
+    expect(linkRefs.restoreMode).not.toHaveBeenCalled();
+    expect(linkRefs.registerSources).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid dispatch attempt %s',
+    (dispatchAttempt) => {
+      const linkRefs = runtime();
+      const result = registerMcpLinkRefsFromWorker({
+        ownsWorkerSession: true,
+        daemonSession: {
+          appId: 'app-host-owned',
+          sessionId: 'session-link-ref',
+          managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt, linkRefMode: 'enabled' },
+        },
+        runtime: linkRefs,
+        request: { ...request, dispatchAttempt },
+      });
+      expect(result).toEqual({ ok: false, error: 'link_ref_identity_mismatch' });
+      expect(linkRefs.registerSources).not.toHaveBeenCalled();
+    },
+  );
+
+  it('converts a restoreMode ledger failure into a worker response', () => {
+    const linkRefs = runtime({ restoreMode: vi.fn(() => { throw new Error('sqlite unavailable'); }) });
+    const result = registerMcpLinkRefsFromWorker({
+      ownsWorkerSession: true,
+      daemonSession: {
+        appId: 'app-host-owned', sessionId: 'session-link-ref',
+        managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'enabled' },
+      },
+      runtime: linkRefs,
+      request,
+    });
+    expect(result).toEqual({ ok: false, error: 'link_ref_ledger_unavailable' });
+  });
+
   it('resolves host-delivery markdown only for the exact open enabled turn', () => {
     const linkRefs = runtime();
     const result = resolveMcpHostDeliveryLinkRefsFromWorker({
       ownsWorkerSession: true,
-      daemonSession: { appId: 'app-host-owned', sessionId: 'session-link-ref' },
+      daemonSession: {
+        appId: 'app-host-owned', sessionId: 'session-link-ref',
+        managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'enabled' },
+      },
       runtime: linkRefs,
       request: {
         sessionId: 'session-link-ref',
@@ -304,5 +360,40 @@ describe('plugin MCP daemon LinkRef authority', () => {
         refCount: 1,
       },
     });
+  });
+
+  it('rejects a stale host-delivery turn before probing the ledger', () => {
+    const linkRefs = runtime();
+    const result = resolveMcpHostDeliveryLinkRefsFromWorker({
+      ownsWorkerSession: true,
+      daemonSession: {
+        appId: 'app-host-owned', sessionId: 'session-link-ref',
+        managedTurnOrigin: { turnId: 'om_newer', dispatchAttempt: 3, linkRefMode: 'enabled' },
+      },
+      runtime: linkRefs,
+      request: {
+        sessionId: 'session-link-ref', turnId: 'om_link_ref', dispatchAttempt: 3,
+        linkRefMode: 'enabled', payload: { text: 'plain' },
+      },
+    });
+    expect(result).toEqual({ ok: false, error: 'link_ref_identity_mismatch' });
+    expect(linkRefs.restoreMode).not.toHaveBeenCalled();
+  });
+
+  it('converts a host-delivery restoreMode failure into a worker response', () => {
+    const linkRefs = runtime({ restoreMode: vi.fn(() => { throw new Error('sqlite unavailable'); }) });
+    const result = resolveMcpHostDeliveryLinkRefsFromWorker({
+      ownsWorkerSession: true,
+      daemonSession: {
+        appId: 'app-host-owned', sessionId: 'session-link-ref',
+        managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'enabled' },
+      },
+      runtime: linkRefs,
+      request: {
+        sessionId: 'session-link-ref', turnId: 'om_link_ref', dispatchAttempt: 3,
+        linkRefMode: 'enabled', payload: { text: 'plain' },
+      },
+    });
+    expect(result).toEqual({ ok: false, error: 'link_ref_ledger_unavailable' });
   });
 });

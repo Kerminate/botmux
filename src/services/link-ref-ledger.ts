@@ -352,16 +352,6 @@ export class LinkRefLedger {
     }
   }
 
-  settleOpenSessionTurns(appId: string, sessionId: string): number {
-    const now = this.now();
-    const result = this.db.prepare(`
-      UPDATE link_ref_turns
-      SET state = 'settled', settled_at_ms = ?, last_activity_at_ms = ?, expires_at_ms = ?
-      WHERE app_id = ? AND session_id = ? AND state = 'open'
-    `).run(now, now, now + LINK_REF_RETENTION_MS, appId, sessionId);
-    return Number(result.changes);
-  }
-
   deleteSession(appId: string, sessionId: string): number {
     return this.transaction(() => {
       // Bun SQLite includes rows removed by ON DELETE CASCADE in `changes`,

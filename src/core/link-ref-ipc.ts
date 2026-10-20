@@ -43,14 +43,27 @@ interface LinkRefDaemonSessionIdentity {
 
 function exactMcpTurnKey(
   daemonSession: LinkRefDaemonSessionIdentity,
-  request: Pick<McpLinkRefRegistrationRequest, 'sessionId' | 'turnId' | 'dispatchAttempt'>,
+  request: Pick<McpLinkRefRegistrationRequest, 'turnId' | 'dispatchAttempt' | 'linkRefMode'>,
 ) {
+  const origin = daemonSession.managedTurnOrigin;
+  if (!origin
+    || typeof request.turnId !== 'string'
+    || request.turnId.length === 0
+    || request.turnId.length > 256
+    || /[\0\r\n]/u.test(request.turnId)
+    || request.turnId !== origin.turnId
+    || request.dispatchAttempt !== origin.dispatchAttempt
+    || request.linkRefMode !== origin.linkRefMode
+    || (request.dispatchAttempt !== undefined
+      && (!Number.isSafeInteger(request.dispatchAttempt) || request.dispatchAttempt <= 0))) {
+    return undefined;
+  }
   return {
     appId: daemonSession.appId,
-    sessionId: request.sessionId,
-    turnId: request.turnId,
-    ...(request.dispatchAttempt !== undefined
-      ? { dispatchAttempt: request.dispatchAttempt }
+    sessionId: daemonSession.sessionId,
+    turnId: origin.turnId,
+    ...(origin.dispatchAttempt !== undefined
+      ? { dispatchAttempt: origin.dispatchAttempt }
       : {}),
   };
 }
@@ -90,10 +103,11 @@ export function registerMcpLinkRefsFromWorker(input: {
     return { ok: false, error: 'link_ref_identity_mismatch' };
   }
   const key = exactMcpTurnKey(daemonSession, request);
-  if (request.linkRefMode === 'enabled' && input.runtime.restoreMode(key) !== 'enabled') {
-    return { ok: false, error: 'link_ref_turn_not_open' };
-  }
+  if (!key) return { ok: false, error: 'link_ref_identity_mismatch' };
   try {
+    if (request.linkRefMode === 'enabled' && input.runtime.restoreMode(key) !== 'enabled') {
+      return { ok: false, error: 'link_ref_turn_not_open' };
+    }
     const result = input.runtime.registerSources({
       key,
       mode: request.linkRefMode,
@@ -124,10 +138,11 @@ export function resolveMcpHostDeliveryLinkRefsFromWorker(input: {
     return { ok: false, error: 'link_ref_identity_mismatch' };
   }
   const key = exactMcpTurnKey(daemonSession, request);
-  if (input.runtime.restoreMode(key) !== 'enabled') {
-    return { ok: false, error: 'link_ref_turn_not_open' };
-  }
+  if (!key) return { ok: false, error: 'link_ref_identity_mismatch' };
   try {
+    if (input.runtime.restoreMode(key) !== 'enabled') {
+      return { ok: false, error: 'link_ref_turn_not_open' };
+    }
     return {
       ok: true,
       payload: input.runtime.resolveForDaemon(key, 'enabled', request.payload),
@@ -151,7 +166,9 @@ const RESOLVE_BODY_KEYS = new Set([
   'originTurnId',
   'originDispatchAttempt',
 ]);
-const RESOLVE_PAYLOAD_KEYS = new Set(['text', 'preparedText', 'card', 'expectedLinks']);
+const RESOLVE_PAYLOAD_KEYS = new Set([
+  'text', 'preparedText', 'card', 'completionProposal', 'expectedLinks',
+]);
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -172,6 +189,7 @@ export function parseLinkRefResolveBody(
   if (payload.text !== undefined && typeof payload.text !== 'string') return { ok: false };
   if (payload.preparedText !== undefined && typeof payload.preparedText !== 'string') return { ok: false };
   if (payload.card !== undefined && !plainRecord(payload.card)) return { ok: false };
+  if (payload.completionProposal !== undefined && !plainRecord(payload.completionProposal)) return { ok: false };
   if (payload.expectedLinks !== undefined
     && (!Array.isArray(payload.expectedLinks)
       || payload.expectedLinks.some(link => typeof link !== 'string'))) return { ok: false };

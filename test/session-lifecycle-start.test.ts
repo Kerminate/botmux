@@ -5701,6 +5701,35 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     expect(init).not.toHaveProperty('replyStyle');
   });
 
+  it('admits LinkRefs from the complete adopt re-fork payload', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<adopt-link-ref-companion />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeAdoptDs();
+
+    forkAdoptWorker(ds, {
+      payload: {
+        content: '<bridge>hello from Lark</bridge>',
+        linkRefs: {
+          mode: 'disabled',
+          sources: [{ sourceType: 'user_message', kind: 'text', text: 'https://example.test/action' }],
+        },
+      },
+      turnId: 'om_adopt_link_ref',
+    });
+
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(vi.mocked((ds.worker as any).send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      prompt: expect.stringContaining('<adopt-link-ref-companion />'),
+      turnId: 'om_adopt_link_ref',
+      linkRefMode: 'enabled',
+    }));
+  });
+
   it('forwards atMostOnce into an adopt init so a retained XPI turn is not replayed by the worker', () => {
     const ds = makeAdoptDs();
     forkAdoptWorker(ds, {

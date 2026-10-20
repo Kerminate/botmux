@@ -90,6 +90,9 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
             ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
             ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
             ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
+            ...(payload.completionProposal === undefined
+              ? {}
+              : { completionProposal: walk(payload.completionProposal) }),
             ...(payload.expectedLinks === undefined
               ? {}
               : { expectedLinks: payload.expectedLinks.map(expand) }),

@@ -83,28 +83,27 @@ const CREDENTIAL_LEAF_FIELDS = new Set([
   'password',
   'passwd',
   'secret',
-  'client-secret',
-  'access-token',
-  'refresh-token',
-  'id-token',
-  'session-token',
-  'api-key',
+  'clientsecret',
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'sessiontoken',
   'apikey',
-  'private-key',
+  'privatekey',
 ]);
 
 const HEADER_CREDENTIAL_FIELDS = new Set([
   'authorization',
-  'proxy-authorization',
+  'proxyauthorization',
   'cookie',
-  'set-cookie',
+  'setcookie',
 ]);
 
-const HEADER_CONTAINER_FIELDS = new Set(['headers', 'request-headers']);
+const HEADER_CONTAINER_FIELDS = new Set(['headers', 'requestheaders']);
 const AUTH_HEADER_VALUE_RE = /^\s*(?:bearer|basic|digest|negotiate|ntlm|token|aws4-hmac-sha256)\s+\S/iu;
 
 function normalizeField(field: string): string {
-  return field.toLowerCase().replace(/_/g, '-');
+  return field.toLowerCase().replace(/[-_]/g, '');
 }
 
 function excludedByMetadata(value: Record<string, unknown>): boolean {

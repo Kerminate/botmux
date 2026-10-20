@@ -10817,6 +10817,42 @@ async function cmdSend(rest: string[]): Promise<void> {
     try { preparedText = readFileSync(expectedLinkPreparedFile, 'utf-8'); }
     catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
   }
+  let completionProposalVisible: CompletionProposalVisibleInput | undefined;
+  let completionProposalOmittedReason: string | undefined;
+  if (completionProposalFile !== undefined) {
+    if (!existsSync(completionProposalFile)) {
+      console.error(`文件不存在: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (!statSync(completionProposalFile).isFile()) {
+      console.error(`不是普通文件: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (effectiveResponseKind !== 'final') {
+      console.error('botmux send: --completion-proposal-file 只能与 --response-kind final 同时使用');
+      process.exit(2);
+    }
+    if (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin || isSlashSend || isOriginDocCommentTurn) {
+      console.error('botmux send: Completion Proposal 仅支持当前会话内的标准 final 卡');
+      process.exit(2);
+    }
+    const proposalJson = readFileSync(completionProposalFile, 'utf8');
+    if (Buffer.byteLength(proposalJson, 'utf8') > 8192) {
+      console.error('botmux send: --completion-proposal-file 不能超过 8 KiB');
+      process.exit(2);
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(proposalJson); }
+    catch {
+      console.error('botmux send: --completion-proposal-file 必须包含有效 JSON');
+      process.exit(2);
+    }
+    try { completionProposalVisible = normalizeCompletionProposalInput(raw); }
+    catch (error) {
+      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  }
   try {
     const trustedLinkRefModes = [
       liveMarkerCtx?.linkRefMode,
@@ -10831,6 +10867,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       text: content,
       ...(preparedText === undefined ? {} : { preparedText }),
       ...(customCard === undefined ? {} : { card: customCard }),
+      ...(completionProposalVisible === undefined
+        ? {}
+        : { completionProposal: completionProposalVisible as unknown as Record<string, unknown> }),
       expectedLinks,
     }, {
       mode: linkRefMode,
@@ -10840,6 +10879,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     content = resolved.text ?? content;
     preparedText = resolved.preparedText ?? preparedText;
     customCard = resolved.card ?? customCard;
+    completionProposalVisible = (resolved.completionProposal
+      ?? completionProposalVisible) as CompletionProposalVisibleInput | undefined;
     expectedLinks = resolved.expectedLinks ?? expectedLinks;
   } catch (error) {
     const code = error instanceof Error ? error.message : 'link_ref_ledger_unavailable';
@@ -10848,6 +10889,48 @@ async function cmdSend(rest: string[]): Promise<void> {
       : 'link_ref_ledger_unavailable';
     console.error(`botmux send refused: ${stable}`);
     process.exit(2);
+  }
+  const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+    ?? frozenTurnDispatch?.replyTargetSenderOpenId
+    ?? turnReplyTarget?.senderOpenId
+    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
+    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
+    // borrowed as a legacy fallback when there is NO currentTurnId (true
+    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
+    // resolve to NO sender — never the global slot, which may have advanced to a
+    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
+    // bug #750 fixed). pickTurnReplyTarget already enforces
+    // quoteTargetId===currentTurnId for its own hit.
+    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+  const proposalRequesterIsExactHuman = !!currentTurnId
+    && !!replyTargetSenderOpenId
+    && collectTurnWindowParticipants(s, currentTurnId).participants
+      .some(participant => participant.openId === replyTargetSenderOpenId && participant.isBot === false);
+  if (completionProposalVisible) {
+    if (!currentTurnId) completionProposalOmittedReason = 'missing_origin_turn';
+    else if (!replyTargetSenderOpenId?.startsWith('ou_') || !proposalRequesterIsExactHuman) {
+      completionProposalOmittedReason = 'missing_exact_human_requester';
+    }
+    else if (!isSuspendableBackendType(s.backendType)) completionProposalOmittedReason = 'backend_not_restart_safe';
+    if (completionProposalOmittedReason) {
+      content = [
+        content.trimEnd(),
+        '',
+        `> **${completionProposalVisible.title}**`,
+        `> ${completionProposalVisible.body}`,
+        '> 如需继续，请直接在当前话题回复。',
+      ].join('\n');
+      completionProposalVisible = undefined;
+      console.error(`botmux send: Completion Proposal 已降级为静态提示 (${completionProposalOmittedReason})`);
+    } else {
+      // LinkRef expansion happens before the proposal policy check so a
+      // placeholder cannot bypass the visible-field URL/sensitive-data rules.
+      try { completionProposalVisible = normalizeCompletionProposalInput(completionProposalVisible); }
+      catch (error) {
+        console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(2);
+      }
+    }
   }
   for (const expectedLink of expectedLinks) {
     let url: URL;
@@ -11024,6 +11107,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       layout: replyLayout,
       imageMode,
       customCard,
+      completionProposal: completionProposalVisible,
       as: asChoice,
     },
     controls: {
@@ -11484,23 +11568,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       rawMentions.push({ identifier: m.trim(), name: '' });
     }
   }
-  const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? turnReplyTarget?.senderOpenId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
-    // borrowed as a legacy fallback when there is NO currentTurnId (true
-    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
-    // resolve to NO sender — never the global slot, which may have advanced to a
-    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
-    // bug #750 fixed). pickTurnReplyTarget already enforces
-    // quoteTargetId===currentTurnId for its own hit.
-    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
-  const proposalRequesterIsExactHuman = !!currentTurnId
-    && !!replyTargetSenderOpenId
-    && collectTurnWindowParticipants(s, currentTurnId).participants
-      .some(participant => participant.openId === replyTargetSenderOpenId && participant.isBot === false);
-
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
   // is exempt. The error text adapts to who is being replied to (人 / bot).
@@ -11657,59 +11724,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
     process.exit(2);
   }
-  let completionProposalVisible: CompletionProposalVisibleInput | undefined;
-  let completionProposalOmittedReason: string | undefined;
-  if (completionProposalFile !== undefined) {
-    if (!existsSync(completionProposalFile)) {
-      console.error(`文件不存在: ${completionProposalFile}`);
-      process.exit(1);
-    }
-    if (!statSync(completionProposalFile).isFile()) {
-      console.error(`不是普通文件: ${completionProposalFile}`);
-      process.exit(1);
-    }
-    if (effectiveResponseKind !== 'final') {
-      console.error('botmux send: --completion-proposal-file 只能与 --response-kind final 同时使用');
-      process.exit(2);
-    }
-    if (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin || isSlashSend) {
-      console.error('botmux send: Completion Proposal 仅支持当前会话内的标准 final 卡');
-      process.exit(2);
-    }
-    const proposalJson = readFileSync(completionProposalFile, 'utf8');
-    if (Buffer.byteLength(proposalJson, 'utf8') > 8192) {
-      console.error('botmux send: --completion-proposal-file 不能超过 8 KiB');
-      process.exit(2);
-    }
-    let raw: unknown;
-    try { raw = JSON.parse(proposalJson); }
-    catch {
-      console.error('botmux send: --completion-proposal-file 必须包含有效 JSON');
-      process.exit(2);
-    }
-    try { completionProposalVisible = normalizeCompletionProposalInput(raw); }
-    catch (error) {
-      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(2);
-    }
-    if (!currentTurnId) completionProposalOmittedReason = 'missing_origin_turn';
-    else if (!replyTargetSenderOpenId?.startsWith('ou_') || !proposalRequesterIsExactHuman) {
-      completionProposalOmittedReason = 'missing_exact_human_requester';
-    }
-    else if (!isSuspendableBackendType(s.backendType)) completionProposalOmittedReason = 'backend_not_restart_safe';
-    if (completionProposalOmittedReason) {
-      content = [
-        content.trimEnd(),
-        '',
-        `> **${completionProposalVisible.title}**`,
-        `> ${completionProposalVisible.body}`,
-        '> 如需继续，请直接在当前话题回复。',
-      ].join('\n');
-      completionProposalVisible = undefined;
-      console.error(`botmux send: Completion Proposal 已降级为静态提示 (${completionProposalOmittedReason})`);
-    }
-  }
-
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
   // turn's window had a single counterpart. Once 2+ distinct people/bots took
@@ -13131,6 +13145,13 @@ async function cmdCard(rest: string[]): Promise<void> {
       try {
         const { sid, larkAppId, session } = await resolveSessionAppId(runtimeParsed.sessionId);
         assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream runtime');
+        if (runtimeParsed.operation === 'bind-runtime' && runtimeParsed.labels) {
+          const resolved = await resolveLinkRefsThroughSessionHost(
+            { card: runtimeParsed.labels as Record<string, unknown> },
+            { sessionId: sid, appId: larkAppId },
+          );
+          runtimeParsed.labels = (resolved.card ?? runtimeParsed.labels) as typeof runtimeParsed.labels;
+        }
         const { patchCardStreamElement, updateCardStreamElementContent } = await import('./im/lark/client.js');
         const streamStore = new CardStreamStore(resolveDataDir());
         const runtimeBridge = new CardRuntimeStatusBridge(resolveDataDir(), streamStore, {
@@ -13203,6 +13224,33 @@ async function cmdCard(rest: string[]): Promise<void> {
 
     const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
     assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream');
+    try {
+      if (parsed.operation === 'write') {
+        const resolved = await resolveLinkRefsThroughSessionHost(
+          { text: contentInput!.content },
+          { sessionId: sid, appId: larkAppId },
+        );
+        contentInput!.content = resolved.text ?? contentInput!.content;
+        if (contentInput!.content.length > 30_000) {
+          console.error('botmux card stream: 展开 LinkRef 后内容超过 30000 字符');
+          process.exit(2);
+        }
+      } else if ('summary' in parsed && parsed.summary !== undefined) {
+        const resolved = await resolveLinkRefsThroughSessionHost(
+          { text: parsed.summary },
+          { sessionId: sid, appId: larkAppId },
+        );
+        parsed.summary = resolved.text ?? parsed.summary;
+        if (parsed.summary.length > 50) {
+          console.error('botmux card stream: 展开 LinkRef 后 --summary 超过 50 字符');
+          process.exit(2);
+        }
+      }
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'link_ref_ledger_unavailable';
+      console.error(`botmux card stream refused: ${code.startsWith('link_ref_') ? code : 'link_ref_ledger_unavailable'}`);
+      process.exit(2);
+    }
     const store = new CardStreamStore(resolveDataDir());
     const authority = { sessionId: sid, larkAppId, chatId: session.chatId };
     const currentTurnId = session.currentReplyTarget?.turnId ?? session.quoteTargetId;
@@ -13373,10 +13421,27 @@ async function cmdCard(rest: string[]): Promise<void> {
   // refused even from a transport-capable turn.
   assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
 
+  let rawCard = input.rawCard;
+  try {
+    const normalized = normalizeInteractiveCardInput(rawCard);
+    if (!normalized.ok) {
+      console.error(`botmux card patch: ${normalized.error}`);
+      process.exit(2);
+    }
+    const resolved = await resolveLinkRefsThroughSessionHost(
+      { card: normalized.card },
+      { sessionId: sid, appId: larkAppId },
+    );
+    rawCard = JSON.stringify(resolved.card ?? normalized.card);
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'link_ref_ledger_unavailable';
+    console.error(`botmux card patch refused: ${code.startsWith('link_ref_') ? code : 'link_ref_ledger_unavailable'}`);
+    process.exit(2);
+  }
   const { updateMessage } = await import('./im/lark/client.js');
   const outcome = await executeCardPatch(
     { updateMessage },
-    { larkAppId, messageId: parsed.messageId, rawCard: input.rawCard },
+    { larkAppId, messageId: parsed.messageId, rawCard },
   );
   if (!outcome.ok) {
     console.error(`botmux card patch: ${outcome.error}`);

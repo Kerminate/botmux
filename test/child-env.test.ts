@@ -136,6 +136,19 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes host-authorized LinkRef relay controls from ordinary children', () => {
+    const out = redactChildEnv({
+      BOTMUX_LINK_REF_TURN_MODE: 'enabled',
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      KEEP: 'v',
+    });
+    for (const key of ['BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED']) {
+      expect(key in out, key).toBe(false);
+      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+    }
+    expect(out.KEEP).toBe('v');
+  });
+
   it('removes the Dashboard Feishu H5 credential family from child env', () => {
     // BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET is a full Feishu app credential: the
     // daemon dotenv-loads ~/.botmux/.env wholesale, so before this scrub every

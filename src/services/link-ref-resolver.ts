@@ -21,6 +21,7 @@ export interface OutboundLinkRefPayload {
   text?: string;
   preparedText?: string;
   card?: Record<string, unknown>;
+  completionProposal?: Record<string, unknown>;
   expectedLinks?: string[];
 }
 
@@ -39,72 +40,108 @@ function lineEnd(text: string, index: number): number {
   return newline < 0 ? text.length : newline;
 }
 
-function tokenize(text: string): RefSpan[] {
-  const spans: RefSpan[] = [];
-  let offset = 0;
-  let fence: { char: '`' | '~'; length: number } | undefined;
-  let inlineTicks = 0;
+interface LiteralRange {
+  start: number;
+  end: number;
+}
 
-  while (offset < text.length) {
+function fencedLiteralRanges(text: string): LiteralRange[] {
+  const ranges: LiteralRange[] = [];
+  for (let offset = 0; offset < text.length;) {
     const end = lineEnd(text, offset);
-    const line = text.slice(offset, end);
-    const fenceMatch = FENCE_PATTERN.exec(line);
-    if (fence) {
-      if (fenceMatch) {
-        const run = fenceMatch[2]!;
-        const char = run[0] as '`' | '~';
-        if (char === fence.char && run.length >= fence.length && fenceMatch[3]!.trim() === '') {
-          fence = undefined;
-        }
+    const opener = FENCE_PATTERN.exec(text.slice(offset, end));
+    if (!opener) {
+      offset = end < text.length ? end + 1 : end;
+      continue;
+    }
+    const openerRun = opener[2]!;
+    const char = openerRun[0] as '`' | '~';
+    let cursor = end < text.length ? end + 1 : end;
+    let closeEnd: number | undefined;
+    while (cursor < text.length) {
+      const candidateEnd = lineEnd(text, cursor);
+      const candidate = FENCE_PATTERN.exec(text.slice(cursor, candidateEnd));
+      const run = candidate?.[2];
+      if (candidate && run?.[0] === char && run.length >= openerRun.length
+        && candidate[3]!.trim() === '') {
+        closeEnd = candidateEnd;
+        break;
       }
+      cursor = candidateEnd < text.length ? candidateEnd + 1 : candidateEnd;
+    }
+    if (closeEnd === undefined) {
+      // An unmatched opener is ordinary model output, not a license to hide
+      // every LinkRef that follows it.
       offset = end < text.length ? end + 1 : end;
       continue;
     }
-    if (fenceMatch && inlineTicks === 0) {
-      const run = fenceMatch[2]!;
-      fence = { char: run[0] as '`' | '~', length: run.length };
-      offset = end < text.length ? end + 1 : end;
-      continue;
-    }
+    ranges.push({ start: offset, end: closeEnd });
+    offset = closeEnd < text.length ? closeEnd + 1 : closeEnd;
+  }
+  return ranges;
+}
 
+function inlineLiteralRanges(text: string, fenced: readonly LiteralRange[]): LiteralRange[] {
+  const ranges: LiteralRange[] = [];
+  let fenceIndex = 0;
+  for (let offset = 0; offset < text.length;) {
+    const end = lineEnd(text, offset);
+    while (fenceIndex < fenced.length && fenced[fenceIndex]!.end < offset) fenceIndex += 1;
+    if (fenced[fenceIndex]?.start === offset) {
+      offset = fenced[fenceIndex]!.end < text.length ? fenced[fenceIndex]!.end + 1 : text.length;
+      fenceIndex += 1;
+      continue;
+    }
     for (let index = offset; index < end;) {
-      if (text[index] === '`') {
-        const run = countRun(text, index, '`');
-        if (inlineTicks === 0) inlineTicks = run;
-        else if (run === inlineTicks) inlineTicks = 0;
+      if (text[index] !== '`') {
+        index += 1;
+        continue;
+      }
+      const run = countRun(text, index, '`');
+      let close = index + run;
+      while (close < end) {
+        if (text[close] !== '`') {
+          close += 1;
+          continue;
+        }
+        const closeRun = countRun(text, close, '`');
+        if (closeRun === run) break;
+        close += closeRun;
+      }
+      if (close >= end) {
+        // CommonMark code spans do not cross a line. Leave an unmatched run
+        // unprotected so a later LinkRef is still executable.
         index += run;
         continue;
       }
-      LINK_REF_PATTERN.lastIndex = index;
-      const match = LINK_REF_PATTERN.exec(text);
-      if (!match || match.index >= end) break;
-      for (; index < match.index;) {
-        if (text[index] === '`') {
-          const run = countRun(text, index, '`');
-          if (inlineTicks === 0) inlineTicks = run;
-          else if (run === inlineTicks) inlineTicks = 0;
-          index += run;
-        } else {
-          index += 1;
-        }
-      }
-      const slashCount = (() => {
-        let count = 0;
-        for (let cursor = match.index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) count += 1;
-        return count;
-      })();
-      const escaped = slashCount % 2 === 1;
-      if (inlineTicks === 0) {
-        spans.push({
-          start: escaped ? match.index - 1 : match.index,
-          end: LINK_REF_PATTERN.lastIndex,
-          refId: match[1]!,
-          escaped,
-        });
-      }
-      index = LINK_REF_PATTERN.lastIndex;
+      ranges.push({ start: index, end: close + run });
+      index = close + run;
     }
     offset = end < text.length ? end + 1 : end;
+  }
+  return ranges;
+}
+
+function tokenize(text: string): RefSpan[] {
+  const spans: RefSpan[] = [];
+  const fenced = fencedLiteralRanges(text);
+  const literals = [...fenced, ...inlineLiteralRanges(text, fenced)]
+    .sort((left, right) => left.start - right.start);
+  let literalIndex = 0;
+  LINK_REF_PATTERN.lastIndex = 0;
+  for (let match = LINK_REF_PATTERN.exec(text); match; match = LINK_REF_PATTERN.exec(text)) {
+    while (literalIndex < literals.length && literals[literalIndex]!.end <= match.index) literalIndex += 1;
+    const literal = literals[literalIndex];
+    if (literal && literal.start <= match.index && match.index < literal.end) continue;
+    let slashCount = 0;
+    for (let cursor = match.index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) slashCount += 1;
+    const escaped = slashCount % 2 === 1;
+    spans.push({
+      start: escaped ? match.index - 1 : match.index,
+      end: LINK_REF_PATTERN.lastIndex,
+      refId: match[1]!,
+      escaped,
+    });
   }
   return spans;
 }
@@ -163,6 +200,9 @@ function tokenizeOutboundPayload(payload: OutboundLinkRefPayload): Map<string, E
   if (payload.preparedText !== undefined) getTokenized(payload.preparedText);
   if (payload.expectedLinks) for (const expectedLink of payload.expectedLinks) getTokenized(expectedLink);
   if (payload.card) walkStrings(payload.card, (text) => { getTokenized(text); return text; });
+  if (payload.completionProposal) {
+    walkStrings(payload.completionProposal, (text) => { getTokenized(text); return text; });
+  }
   return tokenized;
 }
 
@@ -188,6 +228,9 @@ export function expandOutboundLinkRefs(
     ...(payload.text === undefined ? {} : { text: replace(payload.text) }),
     ...(payload.preparedText === undefined ? {} : { preparedText: replace(payload.preparedText) }),
     ...(payload.card === undefined ? {} : { card: walkStrings(payload.card, replace) as Record<string, unknown> }),
+    ...(payload.completionProposal === undefined
+      ? {}
+      : { completionProposal: walkStrings(payload.completionProposal, replace) as Record<string, unknown> }),
     ...(expectedLinks === undefined ? {} : { expectedLinks }),
     refCount: findOutboundExecutableLinkRefs(payload).length,
   };

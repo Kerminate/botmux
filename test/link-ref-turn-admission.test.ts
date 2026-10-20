@@ -101,6 +101,30 @@ describe('LinkRef turn admission', () => {
     expect(linkRefs.restoreMode(key)).toBe('enabled');
   });
 
+  it('opens an enabled turn even when its initial sources contain no URL', () => {
+    const { runtime: linkRefs } = runtime();
+    const before: CliTurnPayload = {
+      content: 'no links yet',
+      linkRefs: {
+        mode: 'disabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'no links yet' }],
+      },
+    };
+
+    const result = linkRefs.prepareTurn({ key, mode: 'enabled', payload: before });
+
+    expect(result).toEqual({ content: 'no links yet', linkRefs: { mode: 'enabled' } });
+    expect(linkRefs.restoreMode(key)).toBe('enabled');
+  });
+
+  it('opens an enabled turn even when it has no initial sources', () => {
+    const { runtime: linkRefs } = runtime();
+
+    linkRefs.prepareTurn({ key, mode: 'enabled', payload: { content: 'no sources' } });
+
+    expect(linkRefs.restoreMode(key)).toBe('enabled');
+  });
+
   it('does not register hidden instructions unless explicitly listed as public docs', () => {
     const sources = initialLinkRefSources({
       userText: 'user https://user.example.test/page',
