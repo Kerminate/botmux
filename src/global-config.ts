@@ -20,9 +20,9 @@ import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
-import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';

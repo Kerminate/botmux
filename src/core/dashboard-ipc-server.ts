@@ -154,6 +154,14 @@ import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { readDeferredTopicBinding, writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  DEFERRED_TOPIC_CLAIM_MAX_BYTES,
+  DEFERRED_TOPIC_CLAIM_ROUTE,
+  DeferredTopicClaimRegistry,
+  deferredTopicRootFactsFromDetail,
+  parseDeferredTopicClaimRequest,
+} from './deferred-topic-claim.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
@@ -194,7 +202,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -445,7 +453,8 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
-import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -1948,6 +1957,40 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     return result.ok
       ? jsonRes(res, 200, result)
       : jsonRes(res, result.status, { ok: false, error: result.error });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+const deferredTopicClaims = new DeferredTopicClaimRegistry({
+  readBinding: sessionId => readDeferredTopicBinding(config.session.dataDir, sessionId),
+  writeBinding: binding => writeDeferredTopicBinding(config.session.dataDir, binding),
+  lookupRoot: async (larkAppId, rootMessageId) => deferredTopicRootFactsFromDetail(
+    await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false, timeoutMs: 10_000 }),
+  ),
+});
+
+/** First-message claim of a silent fresh-topic schedule run for an isolated
+ * CLI that cannot write the host binding sidecar (see deferred-topic-claim). */
+ipcRoute('POST', `/api/sessions/:sessionId/${DEFERRED_TOPIC_CLAIM_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, DEFERRED_TOPIC_CLAIM_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const request = parseDeferredTopicClaimRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_deferred_topic_request' });
+  try {
+    const result = await deferredTopicClaims.handle(ds, request);
+    return result.ok
+      ? jsonRes(res, 200, result)
+      : jsonRes(res, result.status, result);
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
@@ -7598,6 +7641,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
+    senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -7748,6 +7792,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    senderTagHideEmail?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -7764,6 +7809,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    senderTagHideEmail?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -7806,6 +7852,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
@@ -9117,7 +9164,7 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
 //   • parser 从未被调用，`fallback:'device'` 这类被刻意禁止的值也会 200 落盘；
 //   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
 //     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
-const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback']);
+const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback', 'credentialSource']);
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
   let body: { triggerUserAuth?: unknown };
@@ -9184,10 +9231,16 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
     // can still read shared token stores.
     const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    // Platform-backed source: tell the UI whether this machine is bound so the
+    // picker can say what `auto` / `platform` will actually do here.
+    const platformUrl = platformCredentialsUrl();
     jsonRes(res, 200, {
       ok: true,
       policy,
       authorizedCount,
+      credentialSource: credentialSourceOf(policy),
+      platformBound: platformUrl !== null,
+      ...(platformUrl ? { platformCredentialsUrl: platformUrl } : {}),
       tokenStoreEnforced: protection.enforced,
       ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
       ...(mcpAdvisory ? { mcpAdvisory } : {}),

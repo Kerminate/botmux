@@ -17,10 +17,10 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
-  /** Admission-frozen mode for the exact queued turn. */
-  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** This item belongs to the durable-primary Lark Inbox commit protocol. */
   durablePrimaryInbox?: true;
+  /** Admission-frozen mode for the exact queued turn. */
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside
    *  the live-turn marker so the identity wrapper can keep a same-principal
    *  credential across consecutive turns. */

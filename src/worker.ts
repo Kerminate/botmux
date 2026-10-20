@@ -237,6 +237,7 @@ import {
 } from './global-config.js';
 import {
   stopSessionScope,
+  sessionScopePayloadPid,
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import {
@@ -482,6 +483,7 @@ import type {
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import { herdrConfigForSession } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import {
   IdleDetector,
@@ -13925,9 +13927,20 @@ function releaseRawInputRestartGate(): void {
 }
 
 function readPaneLeafComm(observedBackend: SessionBackend | null = backend): string | undefined {
-  const pid = observedBackend?.getChildPid?.();
-  if (!pid) return undefined;
-  const comm = readComm(pid);
+  const panePid = observedBackend?.getChildPid?.();
+  if (!panePid) return undefined;
+  let pid = panePid;
+  let comm = readComm(pid);
+  if (isBareShellComm(comm)) {
+    // The owned scope supervisor deliberately remains a shell so tmux cannot
+    // move the payload out of its cgroup. Inspect its actual child; a payload
+    // stuck in an rcfile shell must still trigger the normal input hold.
+    const payloadPid = sessionScopePayloadPid(pid);
+    if (payloadPid !== pid) {
+      pid = payloadPid;
+      comm = readComm(pid) ?? comm;
+    }
+  }
   if (lastSpawnOuterBwrapActive && process.platform === 'linux' && isBareShellComm(comm)) {
     try {
       const commandLine = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
@@ -16218,8 +16231,8 @@ function sendToPty(
     queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
-    linkRefMode?: 'observe' | 'enabled';
     durablePrimaryInbox?: true;
+    linkRefMode?: 'observe' | 'enabled';
     codexAppDispatchId?: string;
     codexAppSteerable?: true;
     queuedActivationToken?: string;
@@ -16257,8 +16270,8 @@ function sendToPty(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
-    ...(opts.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
     ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+    ...(opts.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -17818,6 +17831,9 @@ async function spawnCli(
   );
   const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
   const reuseRecordedHerdrTarget = !sandboxRequested && !hasMcpRuntimeEntries;
+  // `chatTypes` can keep e.g. DM sessions on the default host; retirement and
+  // selection below must see the same decision.
+  const effectiveHerdrConfig = herdrConfigForSession(cfg.backendConfig, cfg.chatType);
   if (effectiveBackend === 'herdr' && !reuseRecordedHerdrTarget) {
     // Isolation/MCP incarnations move historical shared-host agents to the
     // data-root-scoped managed target. Retire the exact old pane before backend
@@ -17827,12 +17843,14 @@ async function spawnCli(
       ownershipScope: isolationRuntimeDataDir,
       reuseRecordedHerdrTarget,
       persistentBackendTarget: cfg.persistentBackendTarget,
+      herdrConfig: effectiveHerdrConfig,
     });
   }
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
@@ -20976,6 +20994,7 @@ async function spawnCli(
   // proof, not a backend's prediction flag.
   let programStatusRelayPlanCleanup: (() => void) | undefined;
   let programStatusRelayLaunched = false;
+  let scopePayloadLauncherActive = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -20998,6 +21017,7 @@ async function spawnCli(
       );
       spawnBin = scoped.bin;
       spawnArgs = scoped.args;
+      scopePayloadLauncherActive = !!scoped.unitName;
       if (scoped.unitName) {
         log(
           `Launching owned CLI in ${scoped.unitName}`
@@ -21048,6 +21068,7 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      cliId: cfg.cliId,
       model: cfg.model,
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,
@@ -21291,7 +21312,11 @@ async function spawnCli(
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
-  const startWrapperRealPidResolve = (panePid: number): void => {
+  // Continue relay/wrapper resolution from `chainPid` while the backend's
+  // child-pid fence stays pinned to `fencePid` (the pane process; identical to
+  // chainPid except under an owned scope, where the pane is a fixed sh
+  // supervisor and the chain starts at its payload child).
+  const enterPidChain = (chainPid: number, fencePid: number): void => {
     // The OSC 7501 relay sits between the pane and what used to be the pane
     // process: its single direct child is exactly the pid the pane reported
     // before the relay existed (CLI, sandbox wrapper or wrapperCli launcher),
@@ -21301,10 +21326,10 @@ async function spawnCli(
     // daemon-restart reattach to an already-relayed pane is recognised from
     // its cmdline.
     const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
-      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(panePid)));
-    if (!viaRelay) { resolveBehindWrapper(panePid, panePid); return; }
+      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(chainPid)));
+    if (!viaRelay) { resolveBehindWrapper(chainPid, fencePid); return; }
     if (!claudeDataDir && cfg.cliId !== 'codex') return;
-    scheduleWrapperRealCliPid(panePid, {
+    scheduleWrapperRealCliPid(chainPid, {
       findRealPid: (lp) => {
         if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
         // The relay briefly runs `stty` (raw mode) before creating the CLI's
@@ -21313,10 +21338,51 @@ async function spawnCli(
         return children.length === 1 ? children[0] : null;
       },
       getBackend: () => backend,
-      getChildPid: () => backend?.getChildPid?.(),
+      getChildPid: () => (backend?.getChildPid?.() === fencePid ? chainPid : null),
       applyRealPid: (childPid) => {
-        applyResolvedCliPid(childPid, 'program-status relay', panePid);
-        resolveBehindWrapper(childPid, panePid);
+        applyResolvedCliPid(childPid, 'program-status relay', chainPid);
+        resolveBehindWrapper(childPid, fencePid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  // Owned session scope: the pane pid is a fixed sh supervisor deliberately
+  // kept outside the unit (some tmux versions migrate the pane pid into their
+  // own cgroup after fork). The CLI is its single foreground child — unwrap
+  // that layer first, then continue with relay/wrapper resolution from the
+  // payload. Fail-closed: an unrecognised pane behaves exactly as before.
+  const startWrapperRealPidResolve = (panePid: number): void => {
+    if (!scopePayloadLauncherActive) { enterPidChain(panePid, panePid); return; }
+    const bindScopePayload = (payloadPid: number): void => {
+      // Preserve a deeper wrapper/native CLI resolution that already won.
+      // The pane PID remains a valid marker ancestor, but it cannot identify
+      // the payload's open transcript files or Claude's PID-keyed metadata.
+      const observed = backend as SessionBackend & { cliPid?: number };
+      if (!observed.cliPid || observed.cliPid === panePid || observed.cliPid === payloadPid) {
+        applyResolvedCliPid(payloadPid, 'session scope payload', panePid);
+      } else if (bridgeCliPid === panePid) {
+        bridgeCliPid = payloadPid;
+      }
+      log(`Session scope: resolved payload pid ${payloadPid} under pane ${panePid}`);
+    };
+    const payloadPid = sessionScopePayloadPid(panePid);
+    if (payloadPid !== panePid) {
+      bindScopePayload(payloadPid);
+      enterPidChain(payloadPid, panePid);
+      return;
+    }
+    // Payload not observable yet (slow launch rcfile / systemd startup). Keep
+    // discovering until it appears; the shared stale-backend fence (backend
+    // identity + the pane sh staying the backend child) stops the loop on
+    // close or replacement.
+    scheduleWrapperRealCliPid(panePid, {
+      maxAttempts: Number.POSITIVE_INFINITY,
+      findRealPid: sessionScopePayloadPid,
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (resolvedPid) => {
+        bindScopePayload(resolvedPid);
+        enterPidChain(resolvedPid, panePid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -21406,13 +21472,16 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+    // Under an owned scope the pane pid is the supervisor sh; ownership roots
+    // (traex rollout fd / codex native leaf) live under its payload child.
+    const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(cliPid) : cliPid;
     // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
     const wiredPid = cfg.cliId === 'traex'
-      ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
+      ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
       : cfg.cliId === 'codex'
-        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive, codexFilterExecutable)
-        : cliPid;
+        ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+        : ownershipPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
@@ -21446,11 +21515,12 @@ async function spawnCli(
           }
         }
         if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+          const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(pid) : pid;
           const wiredPid = cfg.cliId === 'traex'
-            ? resolveTraexOwnershipPid(pid, traexLauncherActive)
+            ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
             : cfg.cliId === 'codex'
-              ? resolveCodexOwnershipPid(pid, codexLauncherActive, codexFilterExecutable)
-              : pid;
+              ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+              : ownershipPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
@@ -21498,7 +21568,7 @@ async function spawnCli(
     const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
       ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
-      cliPid: cliPid ?? undefined,
+      cliPid: cliPid ? sessionScopePayloadPid(cliPid) : undefined,
       cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
@@ -25542,8 +25612,8 @@ process.on('message', async (raw: unknown) => {
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
-            linkRefMode: msg.linkRefMode,
             durablePrimaryInbox: msg.durablePrimaryInbox,
+            linkRefMode: msg.linkRefMode,
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -25897,8 +25967,8 @@ process.on('message', async (raw: unknown) => {
           ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
-          linkRefMode: msg.linkRefMode,
           durablePrimaryInbox: msg.durablePrimaryInbox,
+          linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),

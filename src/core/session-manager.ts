@@ -78,7 +78,7 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './types.js';
-import type { DaemonSession } from './types.js';
+import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -779,17 +779,32 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
   ].join('\n');
 }
 
+function renderGroupJoinContextBlock(context?: GroupJoinContext): string {
+  if (!context) return '';
+  return [
+    `<botmux_group_join source="lark" trusted="true" event="${context.event}" gate_matched="${context.gateMatched}">`,
+    `  <lark_app_id>${xmlEscape(context.larkAppId)}</lark_app_id>`,
+    `  <chat_id>${xmlEscape(context.chatId)}</chat_id>`,
+    `  <turn_id>${xmlEscape(context.turnId)}</turn_id>`,
+    ...(context.operatorOpenId
+      ? [`  <operator_open_id>${xmlEscape(context.operatorOpenId)}</operator_open_id>`]
+      : []),
+    '</botmux_group_join>',
+  ].join('\n');
+}
+
 /**
  * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
  * (getBot throws for an unknown appId) or an absent key both mean "inject",
  * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
-function senderTagEnabled(larkAppId: string): boolean {
+function senderTagOptions(larkAppId: string): { enabled: boolean; hideEmail: boolean } {
   try {
-    return getBot(larkAppId).config.senderTag !== false;
+    const { senderTag, senderTagHideEmail } = getBot(larkAppId).config;
+    return { enabled: senderTag !== false, hideEmail: senderTagHideEmail === true };
   } catch {
-    return true;
+    return { enabled: true, hideEmail: false };
   }
 }
 
@@ -804,15 +819,17 @@ function senderTagEnabled(larkAppId: string): boolean {
  * at the call sites, so all five injection points (new topic, its codex-app
  * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
  * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
- * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
- * existing tests — keeps the historical always-inject behavior.
+ * judgment and cannot drift apart. `senderTagHideEmail: true` omits only the
+ * email attribute without mutating the resolved sender or daemon identity.
+ * Omitting `larkAppId` — synthetic callers and existing tests — keeps the historical always-inject behavior.
  */
 export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
-  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
+  const options = larkAppId ? senderTagOptions(larkAppId) : { enabled: true, hideEmail: false };
+  if (!options.enabled) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
-  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
+  if (sender.email && !options.hideEmail) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -1279,6 +1296,7 @@ type NewTopicOpts = {
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
   chatContext?: ChatContext;
+  groupJoinContext?: GroupJoinContext;
   sharedGroupContext?: string;
   /** Frozen LinkRef mode for this accepted turn. Missing preserves legacy input. */
   linkRefMode?: LinkRefMode;
@@ -1302,7 +1320,7 @@ type NewTopicOpts = {
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
-  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
+  | 'summaryMemory' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
 
@@ -1417,6 +1435,7 @@ function buildNewTopicBlocks(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1481,6 +1500,7 @@ function buildNewTopicBlocks(
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
+  if (groupJoinContextBlock) blocks.push({ key: 'groupJoin', text: groupJoinContextBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
   if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
@@ -1560,6 +1580,7 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    groupJoinContext?: GroupJoinContext;
     sharedGroupContext?: string;
     linkRefMode?: LinkRefMode;
     linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
@@ -1641,6 +1662,7 @@ export function buildNewTopicCliInput(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -1654,7 +1676,7 @@ export function buildNewTopicCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, groupJoinContextBlock].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -5033,6 +5055,8 @@ async function forkOrShowRepoCard(
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;
+    ds.pendingGroupJoinContext = undefined;
+    ds.pendingTrustedCaller = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
     ds.pendingSender = undefined;
