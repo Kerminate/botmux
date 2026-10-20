@@ -16,7 +16,7 @@ const repo = fileURLToPath(new URL('..', import.meta.url));
 const refId = 'lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const placeholder = `{{botmux_link:${refId}}}`;
 const unknownPlaceholder = '{{botmux_link:lr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}';
-const dacuHost = ['dacu', 'bytedance', 'net'].join('.');
+const dacuHost = 'source.example.test';
 const baseUrl = `https://${dacuHost}/preview_platform/problem`;
 const fullUrl = baseUrl
   + '?b=2&a=1&a=&redirect=%2Ffoo%3Fx%3D1#timeline';

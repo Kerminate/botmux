@@ -29,7 +29,7 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
-const dacuHost = ['dacu', 'bytedance', 'net'].join('.');
+const dacuHost = 'source.example.test';
 const dacuBaseUrl = `https://${dacuHost}/preview_platform/problem`;
 const dacuUrl = `${dacuBaseUrl}?problemId=e2e%2Fcase&source=&source=timeline#timeline`;
 const authorizationUrl = 'https://auth.example.test/authorize'
