@@ -69,6 +69,14 @@ describe('LinkRef resolver', () => {
     expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
   });
 
+  it('keeps refs literal inside CRLF fenced code blocks', () => {
+    const refId = register('https://example.test/private');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = ['```md', placeholder, '```'].join('\r\n');
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
+  });
+
   it.each([
     ['unclosed inline code on the same line', '`unfinished %s'],
     ['unclosed inline code on an earlier line', '`unfinished\n%s'],
@@ -81,6 +89,21 @@ describe('LinkRef resolver', () => {
     expect(resolveOutboundLinkRefs(ledger, key, { text: template.replace('%s', placeholder) }).text)
       .toContain('https://example.test/recovered');
   });
+
+  it('handles many unmatched fence candidates without rescanning the remaining document', () => {
+    const refId = register('https://example.test/recovered');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = [
+      ...Array.from({ length: 8_000 }, (_, index) => `\`\`\` unmatched-${index}`),
+      placeholder,
+    ].join('\n');
+    const startedAt = performance.now();
+
+    const resolved = resolveOutboundLinkRefs(ledger, key, { text }).text;
+
+    expect(resolved).toContain('https://example.test/recovered');
+    expect(performance.now() - startedAt).toBeLessThan(2_000);
+  }, 15_000);
 
   it('deduplicates repeated refs into one ledger lookup', () => {
     const refId = register('https://example.test/p');

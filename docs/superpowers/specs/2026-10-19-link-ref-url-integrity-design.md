@@ -35,6 +35,7 @@ Rollout 记录表明，模型生成最终 `botmux send` 命令时，正文和 `-
 - 不尝试修复没有通过 LinkRef 引用的普通 URL。
 - 不登记模型凭空生成的新 URL；它仍可作为普通 URL 输出。
 - 不扫描普通终端 stdout 或 CLI 私有工具结果来推断来源。第一版的强完整性保证仅覆盖 Botmux 能在交给模型前拦截的输入和工具结果。
+- ask 卡、CoT、report、dispatch 和 `lark-cli` 直发通道不属于 LinkRef 自动展开出口；除非后续显式接入同一套可信 turn 身份与宿主解析协议，否则这些通道只保留原有普通 URL 语义，不得注入 LinkRef companion。
 - 不把 LinkRef 当作主机级安全机制。非沙箱 Agent 与 Botmux 使用同一系统用户时，主动篡改宿主文件属于现有主机信任边界。本设计防止的是模型在文本生成中意外改写来源 URL。
 - LinkRef 不能让模型必然选择引用某条来源。只有最终内容使用 LinkRef 时，Botmux 才能提供来源 URL 的强完整性保证；普通 URL 始终保留原有自由表达语义。
 

@@ -75,6 +75,7 @@ import {
   type LinkRefRuntime,
 } from '../src/services/link-ref-runtime.js';
 import {
+  LinkRefError,
   LINK_REF_RETENTION_MS,
   type LinkRefTurnKey,
 } from '../src/services/link-ref-types.js';
@@ -221,6 +222,45 @@ describe('LinkRef lifecycle wiring', () => {
     expect(ledger.readTurn(appB)).toBeDefined();
     expect(ledger.readPendingDraft(appB)).toBe('private draft B');
     ledger.close();
+  });
+
+  it('silently settles a turn without a LinkRef row after the ledger is open', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-link-ref-missing-settle-'));
+    roots.push(root);
+    const runtime = createLinkRefRuntime(root);
+    runtime.registerSources({
+      key: { appId: 'app', sessionId: 'session', turnId: 'enabled-turn' },
+      mode: 'enabled',
+      sources: [],
+    });
+
+    expect(() => runtime.settleTurn({
+      appId: 'app', sessionId: 'session', turnId: 'disabled-turn',
+    })).not.toThrow();
+    runtime.close();
+  });
+
+  it('still surfaces real ledger failures while settling a turn', () => {
+    const fakeLedger = {
+      openTurn: vi.fn(),
+      registerBatch: vi.fn(() => ({ registered: [], deduplicated: 0, filteredByLimit: 0 })),
+      settleTurn: vi.fn(() => { throw new LinkRefError('link_ref_ledger_unavailable'); }),
+      pruneExpired: vi.fn(() => ({ expired: 0, removed: 0 })),
+      close: vi.fn(),
+    };
+    const runtime = createLinkRefRuntime('/unused', {
+      ledger: () => fakeLedger as unknown as LinkRefLedger,
+    });
+    runtime.registerSources({
+      key: { appId: 'app', sessionId: 'session', turnId: 'enabled-turn' },
+      mode: 'enabled',
+      sources: [],
+    });
+
+    expect(() => runtime.settleTurn({
+      appId: 'app', sessionId: 'session', turnId: 'broken-turn',
+    })).toThrowError(expect.objectContaining({ code: 'link_ref_ledger_unavailable' }));
+    runtime.close();
   });
 
   it('prunes immediately and daily only after the first enabled ledger use', async () => {

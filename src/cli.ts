@@ -5869,6 +5869,47 @@ export async function resolveLinkRefsThroughSessionHost(
   return body.payload;
 }
 
+async function attestCardLinkRefMode(
+  sessionId: string,
+  payload: import('./services/link-ref-resolver.js').OutboundLinkRefPayload,
+): Promise<'enabled' | undefined> {
+  const { findOutboundExecutableLinkRefs } = await import('./services/link-ref-resolver.js');
+  if (findOutboundExecutableLinkRefs(payload).length === 0) return undefined;
+  const dataDir = resolveDataDir();
+  const context = readWorkflowSessionRelayContext({
+    env: process.env,
+    dataDir,
+    includeHostSession: true,
+  });
+  if (!context) {
+    if (process.env.BOTMUX_SEND_RELAY?.trim() || process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim()) {
+      throw new Error('link_ref_identity_mismatch');
+    }
+    return undefined;
+  }
+  if (!context.originChannelId) throw new Error('link_ref_identity_mismatch');
+  const attested = await attestManagedOrigin({
+    context: {
+      sessionId: context.sessionId,
+      channelId: context.originChannelId,
+      capability: context.capability,
+      dataDir,
+      larkAppId: context.larkAppId,
+      ipcPortFallback: context.ipcPortFallback,
+    },
+    resolveIpcPort: (appId) => {
+      try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+      catch { return undefined; }
+    },
+  });
+  if (attested.sessionId !== sessionId) throw new Error('link_ref_identity_mismatch');
+  // Once a protected proof exists, it is the sole authority. A payload already
+  // containing LinkRefs may proceed only for an enabled turn; observe/missing
+  // mode must not fall back or let the placeholder reach the provider.
+  if (attested.linkRefMode !== 'enabled') throw new Error('link_ref_identity_mismatch');
+  return 'enabled';
+}
+
 async function decorateSessionCliLinkRefResult<T extends object>(input: {
   sessionId: string;
   appId: string;
@@ -10980,6 +11021,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       completionProposalOmittedReason = 'missing_exact_human_requester';
     }
     else if (!isSuspendableBackendType(s.backendType)) completionProposalOmittedReason = 'backend_not_restart_safe';
+    if (!completionProposalOmittedReason) {
+      // LinkRef expansion happens before the proposal policy check so a
+      // placeholder cannot bypass the visible-field URL/sensitive-data rules.
+      // A rejected optional proposal must not discard the already-valid final.
+      try { completionProposalVisible = normalizeCompletionProposalInput(completionProposalVisible); }
+      catch { completionProposalOmittedReason = 'expanded_content_policy_rejected'; }
+    }
     if (completionProposalOmittedReason) {
       content = [
         content.trimEnd(),
@@ -10990,14 +11038,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       ].join('\n');
       completionProposalVisible = undefined;
       console.error(`botmux send: Completion Proposal 已降级为静态提示 (${completionProposalOmittedReason})`);
-    } else {
-      // LinkRef expansion happens before the proposal policy check so a
-      // placeholder cannot bypass the visible-field URL/sensitive-data rules.
-      try { completionProposalVisible = normalizeCompletionProposalInput(completionProposalVisible); }
-      catch (error) {
-        console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
-        process.exit(2);
-      }
     }
   }
   for (const expectedLink of expectedLinks) {
@@ -13196,9 +13236,11 @@ async function cmdCard(rest: string[]): Promise<void> {
         const { sid, larkAppId, session } = await resolveSessionAppId(runtimeParsed.sessionId);
         assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream runtime');
         if (runtimeParsed.operation === 'bind-runtime' && runtimeParsed.labels) {
+          const linkRefPayload = { card: runtimeParsed.labels as Record<string, unknown> };
+          const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
           const resolved = await resolveLinkRefsThroughSessionHost(
-            { card: runtimeParsed.labels as Record<string, unknown> },
-            { sessionId: sid, appId: larkAppId },
+            linkRefPayload,
+            { mode: linkRefMode, sessionId: sid, appId: larkAppId },
           );
           runtimeParsed.labels = (resolved.card ?? runtimeParsed.labels) as typeof runtimeParsed.labels;
         }
@@ -13276,9 +13318,11 @@ async function cmdCard(rest: string[]): Promise<void> {
     assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream');
     try {
       if (parsed.operation === 'write') {
+        const linkRefPayload = { text: contentInput!.content };
+        const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
         const resolved = await resolveLinkRefsThroughSessionHost(
-          { text: contentInput!.content },
-          { sessionId: sid, appId: larkAppId },
+          linkRefPayload,
+          { mode: linkRefMode, sessionId: sid, appId: larkAppId },
         );
         contentInput!.content = resolved.text ?? contentInput!.content;
         if (contentInput!.content.length > 30_000) {
@@ -13286,9 +13330,11 @@ async function cmdCard(rest: string[]): Promise<void> {
           process.exit(2);
         }
       } else if ('summary' in parsed && parsed.summary !== undefined) {
+        const linkRefPayload = { text: parsed.summary };
+        const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
         const resolved = await resolveLinkRefsThroughSessionHost(
-          { text: parsed.summary },
-          { sessionId: sid, appId: larkAppId },
+          linkRefPayload,
+          { mode: linkRefMode, sessionId: sid, appId: larkAppId },
         );
         parsed.summary = resolved.text ?? parsed.summary;
         if (parsed.summary.length > 50) {
@@ -13478,9 +13524,11 @@ async function cmdCard(rest: string[]): Promise<void> {
       console.error(`botmux card patch: ${normalized.error}`);
       process.exit(2);
     }
+    const linkRefPayload = { card: normalized.card };
+    const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
     const resolved = await resolveLinkRefsThroughSessionHost(
-      { card: normalized.card },
-      { sessionId: sid, appId: larkAppId },
+      linkRefPayload,
+      { mode: linkRefMode, sessionId: sid, appId: larkAppId },
     );
     rawCard = JSON.stringify(resolved.card ?? normalized.card);
   } catch (error) {

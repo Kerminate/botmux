@@ -45,38 +45,60 @@ interface LiteralRange {
   end: number;
 }
 
+interface FenceLine {
+  start: number;
+  end: number;
+  char: '`' | '~';
+  runLength: number;
+  canClose: boolean;
+}
+
 function fencedLiteralRanges(text: string): LiteralRange[] {
-  const ranges: LiteralRange[] = [];
+  const fences: FenceLine[] = [];
   for (let offset = 0; offset < text.length;) {
     const end = lineEnd(text, offset);
-    const opener = FENCE_PATTERN.exec(text.slice(offset, end));
-    if (!opener) {
-      offset = end < text.length ? end + 1 : end;
-      continue;
+    const contentEnd = end > offset && text[end - 1] === '\r' ? end - 1 : end;
+    const fence = FENCE_PATTERN.exec(text.slice(offset, contentEnd));
+    if (fence) {
+      const run = fence[2]!;
+      fences.push({
+        start: offset,
+        end,
+        char: run[0] as '`' | '~',
+        runLength: run.length,
+        canClose: fence[3]!.trim() === '',
+      });
     }
-    const openerRun = opener[2]!;
-    const char = openerRun[0] as '`' | '~';
-    let cursor = end < text.length ? end + 1 : end;
-    let closeEnd: number | undefined;
-    while (cursor < text.length) {
-      const candidateEnd = lineEnd(text, cursor);
-      const candidate = FENCE_PATTERN.exec(text.slice(cursor, candidateEnd));
-      const run = candidate?.[2];
-      if (candidate && run?.[0] === char && run.length >= openerRun.length
-        && candidate[3]!.trim() === '') {
-        closeEnd = candidateEnd;
-        break;
+    offset = end < text.length ? end + 1 : end;
+  }
+
+  const closerByFence = new Array<number | undefined>(fences.length);
+  const nearestCloser = {
+    '`': [] as Array<number | undefined>,
+    '~': [] as Array<number | undefined>,
+  };
+  for (let index = fences.length - 1; index >= 0; index -= 1) {
+    const fence = fences[index]!;
+    const nearestForChar = nearestCloser[fence.char];
+    closerByFence[index] = nearestForChar[fence.runLength];
+    if (fence.canClose) {
+      for (let runLength = 3; runLength <= fence.runLength; runLength += 1) {
+        nearestForChar[runLength] = index;
       }
-      cursor = candidateEnd < text.length ? candidateEnd + 1 : candidateEnd;
     }
-    if (closeEnd === undefined) {
+  }
+
+  const ranges: LiteralRange[] = [];
+  for (let index = 0; index < fences.length;) {
+    const closeIndex = closerByFence[index];
+    if (closeIndex === undefined) {
       // An unmatched opener is ordinary model output, not a license to hide
       // every LinkRef that follows it.
-      offset = end < text.length ? end + 1 : end;
+      index += 1;
       continue;
     }
-    ranges.push({ start: offset, end: closeEnd });
-    offset = closeEnd < text.length ? closeEnd + 1 : closeEnd;
+    ranges.push({ start: fences[index]!.start, end: fences[closeIndex]!.end });
+    index = closeIndex + 1;
   }
   return ranges;
 }

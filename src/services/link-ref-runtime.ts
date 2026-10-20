@@ -231,7 +231,12 @@ export function createLinkRefRuntime(
       openedLedger?.clearPendingDraft(key);
     },
     settleTurn(key) {
-      openedLedger?.settleTurn(key);
+      try {
+        openedLedger?.settleTurn(key);
+      } catch (error) {
+        if (error instanceof LinkRefError && error.code === 'link_ref_turn_missing') return;
+        throw error;
+      }
     },
     deleteSession(appId, sessionId) {
       return openedLedger?.deleteSession(appId, sessionId) ?? 0;

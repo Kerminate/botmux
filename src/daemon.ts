@@ -27379,8 +27379,8 @@ async function handleThreadReplyAdmitted(
           // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
           // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
-            turnId: queuedHasDurableTail ? undefined : parsed.messageId,
-            linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+          turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
           sessionBackendType: ds.session.backendType,
           larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
@@ -29071,7 +29071,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Inert until an enabled turn is admitted: construction performs no URL
   // scan and does not open, create, query, or prune the LinkRef ledger.
   initializeLinkRefRuntime(config.session.dataDir);
-
 
   // Survive a fire-and-forget rejection instead of dying from it. Installed here
   // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points

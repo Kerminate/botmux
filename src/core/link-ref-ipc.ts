@@ -45,6 +45,10 @@ function exactMcpTurnKey(
   daemonSession: LinkRefDaemonSessionIdentity,
   request: Pick<McpLinkRefRegistrationRequest, 'turnId' | 'dispatchAttempt' | 'linkRefMode'>,
 ) {
+  // Production MCP producers always send dispatchAttempt > 0 for attempted
+  // turns. Keep exact equality here: the ledger normalizes an omitted attempt
+  // to 0 internally, but undefined request provenance must not inherit that
+  // storage detail and become equivalent to an explicit attempt.
   const origin = daemonSession.managedTurnOrigin;
   if (!origin
     || typeof request.turnId !== 'string'
