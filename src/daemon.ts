@@ -1,3 +1,4 @@
+import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
@@ -372,6 +373,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   closeSessionForBackgroundCleanup,
+  hasPendingOrdinaryImInput,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -567,6 +569,7 @@ import {
   type XpiSharedCwdDispatchUnknownStartupNotice,
   type XpiSharedCwdStartupNotice,
 } from './core/xpi-shared-cwd-admission.js';
+import { MissingWorkingDirError, publishWorkingDirRecovery } from './core/working-dir-recovery.js';
 import {
   XpiSessionStoreBusyRetryScheduler,
   type XpiSessionStoreBusyRetryEvent,
@@ -5753,6 +5756,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   }
   // New turn — the previous turn's deliberate-silence marker (if any) has been
   // baked into the frozen card above; live cards return to normal labels.
+  ds.messageListenerCompletedTurnId = undefined;
   ds.silentIdleTurnId = undefined;
   ds.completedIdleTurnId = undefined;
   ds.failedIdleTurnId = undefined;
@@ -23242,6 +23246,8 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
   const noticeKey = ctx.ingressAdmission?.admitted
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
     : 'daemon.ordinary_ingress_failed';
+  // forkWorker already told the chat (recovery card / "still missing" line).
+  if (err instanceof MissingWorkingDirError) throw err;
   const cliSelectionRejected = err instanceof Error && err.message.startsWith('CLI selection rejected:');
   const xpiQueueFull = err instanceof XpiSharedCwdQueueFullError;
   const notice = cliSelectionRejected
@@ -24042,6 +24048,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
+  if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -27395,6 +27402,7 @@ async function handleThreadReplyAdmitted(
     // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it):
     // without clearing, a previous turn's deliberate-silence marker survives the
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
+    ds.messageListenerCompletedTurnId = undefined;
     ds.silentIdleTurnId = undefined;
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
@@ -27481,7 +27489,7 @@ async function handleThreadReplyAdmitted(
         const recoverThroughCodexLedger = isCodexAppCliId(
           ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
         );
-        forkWorker(
+        const queuedReforkAccepted = forkWorker(
           ds,
           recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
           {
@@ -27493,6 +27501,17 @@ async function handleThreadReplyAdmitted(
               : {}),
           },
         );
+        // A user-triggered refork ends the post-restart recovery silence. This
+        // queued path returns without rememberLastCliInput (the ordinary place
+        // that clears suppressRecoveryCard), so without this line the flag
+        // survives forever: a later async worker death is muted by
+        // notifyStartupFailure and the user gets zero feedback, message after
+        // message. Clear ONLY the recovery flag — no rememberLastCliInput here.
+        // Gate on the same acceptance result as the main refork path: a sync
+        // throw keeps the flag via the catch below, and a false return
+        // (quarantine / session no longer active rejection leg) keeps it too
+        // and falls through to the ingress "please resend" notice.
+        if (queuedReforkAccepted) ds.suppressRecoveryCard = undefined;
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         ds.initialStartPending = false;
@@ -27511,12 +27530,19 @@ async function handleThreadReplyAdmitted(
     if (retainedQueuedActivation) {
       await stageCurrentBehindQueuedActivation();
       try {
-        forkWorker(ds, retainedQueuedActivation, {
+        const retainedReforkAccepted = forkWorker(ds, retainedQueuedActivation, {
           resume: ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           ...(retainedQueuedActivation.trustedCaller ? { trustedCaller: retainedQueuedActivation.trustedCaller } : {}),
         });
+        // Same recovery-silence contract as the queuedActivationPending branch
+        // above: only an ACCEPTED fork (true, same predicate as the main
+        // refork path) means the user has intervened and clears
+        // suppressRecoveryCard (this path also skips rememberLastCliInput), so
+        // a later async worker failure still notifies instead of being muted.
+        // A false return keeps the silence and routes to the ingress notice.
+        if (retainedReforkAccepted) ds.suppressRecoveryCard = undefined;
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         // Keep the staged tail for a later activation attempt, but release the
@@ -28771,6 +28797,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
       // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
       // see the Lark-message re-fork branch above.
+      ds.messageListenerCompletedTurnId = undefined;
       ds.silentIdleTurnId = undefined;
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
@@ -29883,11 +29910,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
+  const scheduleMessageListenerAutoClose = createMessageListenerAutoCloseScheduler({
+    mutate: (ds, action) => runDetachedBotTurnMutation(ds.larkAppId, action),
+    isCurrent: ds => findActiveBySessionId(ds.session.sessionId) === ds && !hasPendingOrdinaryImInput(ds),
+    closeCompletedSession: async ds => {
+      const result = await closeSessionForBackgroundCleanup(ds.session.sessionId, 'message-listener completion');
+      if (result.ok) logger.info(`[message-listener] Auto-closed completed session ${ds.session.sessionId.slice(0, 8)}`);
+    },
+    onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
+  });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
+    onMissingWorkingDir(ds, path, ctx) {
+      void publishWorkingDirRecovery(ds, path, { sessionReply, lastRepoScan }, ctx).catch(err => {
+        logger.warn(`[${tag(ds)}] working-dir recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
@@ -29918,6 +29959,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
         else if (context.prevStatus === 'limited') clearLimitedFailedTurn(ds);
@@ -30085,11 +30127,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
+      if (ds.session.messageListenerAutoClose && ds.currentTurnId === terminal.turnId) {
+        ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
+        scheduleMessageListenerAutoClose(ds);
+      }
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
     onCliExit(ds, context) {
+      ds.messageListenerCompletedTurnId = undefined;
       ds.activeInteractiveTurn = undefined;
       // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
       // exit inside a still-live Node worker (persistent-pane / codex-app
@@ -30113,6 +30160,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     },
     onWorkerExit(ds, context) {
+      ds.messageListenerCompletedTurnId = undefined;
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.

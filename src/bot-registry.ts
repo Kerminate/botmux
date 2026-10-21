@@ -155,7 +155,8 @@ export const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
 /**
  * Normalize an untrusted `turnTimeoutMs` value: a positive integer within the
  * arm-able bound is kept, anything else (≤0, non-integer, over the bound,
- * non-number, absent) collapses to `undefined` (= use the runner default).
+ * non-number, absent) collapses to `undefined`, which leaves the dsh runner
+ * watchdog disabled (no turn timer is armed).
  */
 export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
   return typeof value === 'number'
@@ -229,6 +230,8 @@ export type MessageListenerSenderType = 'user' | 'bot';
 
 export interface MessageListenerConfig {
   enabled: boolean;
+  /** Opt in to closing listener-created sessions after successful completion. */
+  autoCloseAfterCompletion?: boolean;
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
@@ -1187,6 +1190,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   return {
     enabled,
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
+    ...(entry.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(normalizeNonEmptyString(entry.replyCardTitle) ? { replyCardTitle: normalizeNonEmptyString(entry.replyCardTitle) } : {}),
     ...(normalizeNonEmptyString(entry.workingDir) ? { workingDir: normalizeNonEmptyString(entry.workingDir) } : {}),
     prompt: prompt ?? '',
@@ -1542,10 +1546,10 @@ export interface BotConfig {
   modelBackendVariant?: 'standard' | 'max';
   /**
    * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
-   * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
-   * default (`DEFAULT_TURN_TIMEOUT_MS` in dsh-runner.ts). Positive integer
-   * only; unset/≤0/non-integer → runner default. Only affects the `dsh` CLI
-   * adapter; other adapters ignore the field.
+   * it as `--turn-timeout-ms` to arm the runner's idle watchdog (with a hard
+   * cap of 4x this value). Positive integer only; unset/≤0/non-integer means
+   * no watchdog is armed (the default — a turn runs until dsh reports idle).
+   * Only affects the `dsh` CLI adapter; other adapters ignore the field.
    */
   turnTimeoutMs?: number;
   /**
@@ -4007,7 +4011,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.modelBackendVariant
         : undefined,
       // Positive integer within the arm-able bound only; anything else → undefined
-      // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
+      // (= dsh runner watchdog stays disabled). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
       // dsh-only runtime variant; non-dsh CLIs drop it (same pattern as turnTimeoutMs).
       dshRuntime: entryCliId === 'dsh' ? normalizeDshRuntime(entry.dshRuntime) : undefined,
