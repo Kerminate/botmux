@@ -242,3 +242,66 @@ describe('POST /api/sessions/:sessionId/link-refs/register', () => {
     expect(registerSources).not.toHaveBeenCalled();
   });
 });
+
+// Regression: link-refs/resolve must share the narrow untrushed-auth aperture
+// with link-refs/register. In an isolated (bwrap / macOS Seatbelt) session the
+// CLI has no host HMAC secret; if resolve is absent from routeHasNarrowUntrustedAuth
+// the outer gate returns 401 before the handler's own capability check, so every
+// enabled isolated `botmux send` carrying a ref exits 2 (link_ref_ledger_unavailable).
+describe('narrow untrusted-auth aperture covers both link-ref routes', () => {
+  async function capabilityOnly(route: 'link-refs/register' | 'link-refs/resolve'): Promise<Response> {
+    const server = await ensureServer();
+    installSession({ linkRefMode: 'enabled' });
+    installRuntime();
+    const path = `/api/sessions/${SESSION_ID}/${route}`;
+    // Deliberately NO host HMAC headers: isolated CLI presents only the
+    // rotating per-turn capability inside the body.
+    const body = route === 'link-refs/register'
+      ? {
+          sourceType: 'history',
+          sourceId: 'history-result',
+          value: { text: fullUrl },
+          originCapability: CAPABILITY,
+        }
+      : { originCapability: CAPABILITY, payload: { text: 'x' } };
+    return fetch(`http://127.0.0.1:${server.port}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it.each(['link-refs/register', 'link-refs/resolve'] as const)(
+    'routes %s past the outer 401 gate with a capability-only request',
+    async (route) => {
+      const response = await capabilityOnly(route);
+      // Must not be the outer "unauthorized" dead-end. register resolves 200;
+      // resolve reaches its handler too (4xx other than 401, or 200).
+      expect(response.status).not.toBe(401);
+    },
+  );
+});
+
+import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
+
+// Set-level invariant: every narrow session sub-route (master's full list plus
+// the link-ref routes this PR adds) must pass the untrusted-auth aperture.
+// A merge that silently replaces one alternative (the R6 deferred-topic and
+// the link-refs/resolve misses) breaks this list.
+describe('routeHasNarrowUntrustedAuth session-route set invariant', () => {
+  const sessionRoutes = [
+    'slash', 'cd', 'close', 'preview', 'chat-rename', 'chat-manager', 'rename',
+    'project', 'project-dispatch-policy', 'continuation', 'durable-send',
+    'turn-delivery', 'deferred-topic', 'link-refs/register', 'link-refs/resolve',
+    'auth-request', 'auth-status',
+  ] as const;
+
+  it.each([...sessionRoutes])('covers POST /api/sessions/:id/%s', (route) => {
+    expect(routeHasNarrowUntrustedAuth('POST', `/api/sessions/${SESSION_ID}/${route}`)).toBe(true);
+  });
+
+  it('does not widen the aperture to GET or other paths', () => {
+    expect(routeHasNarrowUntrustedAuth('GET', `/api/sessions/${SESSION_ID}/link-refs/resolve`)).toBe(false);
+    expect(routeHasNarrowUntrustedAuth('POST', `/api/sessions/${SESSION_ID}/something-else`)).toBe(false);
+  });
+});
