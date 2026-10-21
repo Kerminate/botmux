@@ -211,8 +211,9 @@ Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可�
 
 | 命令 | 说明 |
 |------|------|
-| `/adopt` | 扫描本机 tmux，弹卡片选择要接入的已运行会话 |
-| `/adopt <tmux_pane>` | 直接接入指定 pane（如 `/adopt 0:2.0`） |
+| `/adopt` | 扫描本机 tmux、Zellij、Herdr 和 Orca，弹卡片选择已运行会话；Orca 支持为实验性能力 |
+| `/adopt <target>` | 直接接入指定 tmux / Zellij / Herdr 会话（如 `/adopt 0:2.0`） |
+| `/adopt orca:<terminal>` | 直接接入指定 Orca 会话（实验性） |
 | `/detach` | 断开本话题与 adopt 会话的桥接（原 CLI 不受影响，`/disconnect` 同义） |
 
 ## 🔐 用户授权

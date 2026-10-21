@@ -211,8 +211,9 @@ The panel needs the optional scopes `application:app_slash_command:read` / `appl
 
 | Command | Description |
 |------|------|
-| `/adopt` | Scan the local tmux and pop up a card to select a running session to adopt |
-| `/adopt <tmux_pane>` | Directly adopt the specified pane (e.g. `/adopt 0:2.0`) |
+| `/adopt` | Scan local tmux, Zellij, Herdr, and Orca sessions and open a picker; Orca support is experimental |
+| `/adopt <target>` | Directly adopt a specific tmux / Zellij / Herdr session (e.g. `/adopt 0:2.0`) |
+| `/adopt orca:<terminal>` | Directly adopt a specific Orca session (experimental) |
 | `/detach` | Disconnect this topic from the adopted session (the original CLI is untouched; `/disconnect` is an alias) |
 
 ## 🔐 User Authorization

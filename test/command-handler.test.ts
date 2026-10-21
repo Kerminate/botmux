@@ -4776,6 +4776,8 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
       expect(replyContent).toContain('/login');
+      expect(replyContent).toContain('/adopt orca:<terminal>');
+      expect(replyContent).toContain('实验性');
       expect(replyContent).toContain('/workflow <目标>');
       expect(replyContent).toContain('/workflow run <名称>');
       expect(replyContent).toContain('/workflow save last');

@@ -63,7 +63,9 @@ import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
-import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
+import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
+import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
+import { adoptedFromForTarget, isOrcaAdoptTarget, isZellijAdoptTarget, type LiveAdoptTarget } from './adopt-target.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
@@ -4600,7 +4602,9 @@ export async function handleCommand(
           // ("session:paneId" / "session/paneId") against the merged list.
           const zellijNorm = directTarget.replace('/', ':');
           const target = sessions.find(s =>
-            'zellijPaneId' in s
+            'orcaTerminalHandle' in s
+              ? directTarget === `orca:${s.orcaTerminalHandle}` || directTarget === s.orcaTerminalHandle
+              : 'zellijPaneId' in s
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
@@ -6236,6 +6240,7 @@ export async function handleCommand(
           t('help.heading_adopt', undefined, loc),
           t('help.adopt', undefined, loc),
           t('help.adopt_pane', undefined, loc),
+          t('help.adopt_orca', undefined, loc),
           t('help.resume', { cliName }, loc),
           t('help.detach', undefined, loc),
           '',
@@ -6358,11 +6363,6 @@ async function handleCodexAppAdoptCommand(
 }
 
 // ─── Adopt session helper ────────────────────────────────────────────────────
-
-/** Discriminate a zellij adopt candidate from tmux/herdr candidates. */
-function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is ZellijAdoptableSession {
-  return 'zellijPaneId' in t;
-}
 
 /**
  * Refuse a takeover (`/adopt`, Codex App thread, disk resume import) while the
@@ -6505,7 +6505,7 @@ export async function startCodexAppThreadSession(
 }
 
 export async function startAdoptSession(
-  target: AdoptableSession | ZellijAdoptableSession,
+  target: LiveAdoptTarget,
   ds: DaemonSession,
   deps: CommandHandlerDeps,
   larkAppId?: string,
@@ -6521,14 +6521,16 @@ export async function startAdoptSession(
 
   if (await blockRiffTakeover(ds, sessionReply)) return;
 
-  const zellij = isZellijTarget(target);
-  if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
+  const orca = isOrcaAdoptTarget(target);
+  const zellij = !orca && isZellijAdoptTarget(target);
+  const paneTarget = !orca && !zellij ? target as AdoptableSession : undefined;
+  if (paneTarget?.source === 'herdr' && paneTarget.herdrSessionName && paneTarget.herdrAgentName) {
     const occupied = [...deps.activeSessions.values()].some(active => {
       if (active.session.sessionId === ds.session.sessionId || active.session.status !== 'active' || active.adoptedFrom) return false;
       const owned = active.session.persistentBackendTarget;
       return owned?.backendType === 'herdr'
-        && owned.sessionName === target.herdrSessionName
-        && owned.agentName === target.herdrAgentName;
+        && owned.sessionName === paneTarget.herdrSessionName
+        && owned.agentName === paneTarget.herdrAgentName;
     });
     if (occupied) {
       await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
@@ -6557,8 +6559,9 @@ export async function startAdoptSession(
   // and offer a one-tap close so the user retires it and re-adopts cleanly.
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
-  const valid = zellij
-    ? validateZellijAdoptTarget(
+  const valid = orca
+    ? validateOrcaAdoptTarget(target) === 'alive'
+    : zellij ? validateZellijAdoptTarget(
       target.zellijSession,
       target.zellijPaneId,
       target.cliPid,
@@ -6572,7 +6575,9 @@ export async function startAdoptSession(
   }
 
   const project = target.cwd.split('/').pop() || target.cwd;
-  const pane = zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
+  const pane = orca
+    ? adoptTargetLabel(target)
+    : zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
   const targetSessionId = ds.session.sessionId;
   const adopted = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(
@@ -6587,23 +6592,7 @@ export async function startAdoptSession(
     current.session.workingDir = target.cwd;
     current.session.title = `Adopt: ${project}`;
     current.session.serviceTier = 'inherit';
-    current.adoptedFrom = {
-      source: zellij ? 'zellij' : target.source,
-      tmuxTarget: zellij ? undefined : target.tmuxTarget,
-      zellijSession: zellij ? target.zellijSession : undefined,
-      zellijPaneId: zellij ? target.zellijPaneId : undefined,
-      herdrSessionName: zellij ? undefined : target.herdrSessionName,
-      herdrTarget: zellij ? undefined : target.herdrTarget,
-      herdrPaneId: zellij ? undefined : target.herdrPaneId,
-      herdrAgentName: zellij ? undefined : target.herdrAgentName,
-      herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
-      originalCliPid: target.cliPid,
-      sessionId: target.sessionId,
-      cliId: target.cliId,
-      cwd: target.cwd,
-      paneCols: target.paneCols,
-      paneRows: target.paneRows,
-    };
+    current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
     sessionStore.updateSession(current.session);
     forkAdoptWorker(current);

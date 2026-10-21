@@ -140,21 +140,14 @@ describe('RemoteRunnerBackend', () => {
     const final = once<{ text: string; turnId?: string }>(cb => {
       backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
     });
-    await backend.submitTurn({
-      turnId: 'turn-final-outbound',
-      content: 'final-outbound',
-      linkRefMode: 'enabled',
-    });
+    await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
     await expect(final).resolves.toEqual({ text: '', turnId: 'turn-final-outbound' });
-    expect(delivery).toHaveBeenCalledWith(
-      expect.objectContaining({
-        responseKind: 'final',
-        mention: 'explicit',
-        mentions: ['ou_target:Target'],
-        content: 'final payload',
-      }),
-      { linkRefMode: 'enabled' },
-    );
+    expect(delivery).toHaveBeenCalledWith(expect.objectContaining({
+      responseKind: 'final',
+      mention: 'explicit',
+      mentions: ['ou_target:Target'],
+      content: 'final payload',
+    }), {});
   });
 
   it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
