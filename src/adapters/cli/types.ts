@@ -2,7 +2,7 @@ import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
-import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -917,6 +917,8 @@ export interface StructuredBridgeDrainResult {
   /** Driver-owned incremental state. The worker hands it back verbatim as
    *  {@link StructuredBridgeDrainContext.state} and never looks inside. */
   state?: unknown;
+  /** Background tasks started / stopped in this byte range (Grok). */
+  backgroundTasks?: BackgroundTaskSignals;
 }
 
 export interface StructuredBridgeDrainContext {
