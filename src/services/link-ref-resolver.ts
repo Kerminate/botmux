@@ -1,4 +1,5 @@
 import type { LinkRefLedger } from './link-ref-ledger.js';
+import { enforceFinalLinkIntegrity, type LinkIntegrityResponseKind } from './final-link-integrity.js';
 import { LinkRefError, type LinkRefTurnKey } from './link-ref-types.js';
 
 const LINK_REF_SOURCE = String.raw`\{\{botmux_link:(lr_[0-9a-f]{32})\}\}`;
@@ -23,6 +24,11 @@ export interface OutboundLinkRefPayload {
   card?: Record<string, unknown>;
   completionProposal?: Record<string, unknown>;
   expectedLinks?: string[];
+}
+
+export interface OutboundLinkRefRequest {
+  payload: OutboundLinkRefPayload;
+  responseKind?: LinkIntegrityResponseKind;
 }
 
 export interface ResolvedOutboundLinkRefs extends OutboundLinkRefPayload {
@@ -262,8 +268,15 @@ export function resolveOutboundLinkRefs(
   ledger: LinkRefLedger,
   key: LinkRefTurnKey,
   payload: OutboundLinkRefPayload,
+  responseKind?: LinkIntegrityResponseKind,
 ): ResolvedOutboundLinkRefs {
   const refIds = findOutboundExecutableLinkRefs(payload);
   const resolved = refIds.length === 0 ? new Map<string, string>() : ledger.resolveBatch(key, refIds);
-  return expandOutboundLinkRefs(payload, resolved);
+  const expanded = expandOutboundLinkRefs(payload, resolved);
+  enforceFinalLinkIntegrity({
+    payload: expanded,
+    responseKind,
+    registeredUrls: ledger.listRegistered(key).map(entry => entry.originalUrl),
+  });
+  return expanded;
 }

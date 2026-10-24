@@ -350,6 +350,7 @@ describe('plugin MCP daemon LinkRef authority', () => {
         turnId: 'om_link_ref',
         dispatchAttempt: 3,
         linkRefMode: 'enabled',
+        responseKind: 'final',
         payload: { text: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}' },
       },
     });
@@ -360,6 +361,17 @@ describe('plugin MCP daemon LinkRef authority', () => {
         refCount: 1,
       },
     });
+    expect(linkRefs.resolveForDaemon).toHaveBeenCalledWith(
+      {
+        appId: 'app-host-owned',
+        sessionId: 'session-link-ref',
+        turnId: 'om_link_ref',
+        dispatchAttempt: 3,
+      },
+      'enabled',
+      { text: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}' },
+      'final',
+    );
   });
 
   it('rejects a stale host-delivery turn before probing the ledger', () => {

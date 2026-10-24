@@ -44,6 +44,22 @@ describe('automatic final LinkRef drafts', () => {
     expect(ledger.readPendingDraft(key)).toBeUndefined();
   });
 
+  it('rejects a truncated direct URL in an automatic final without a LinkRef placeholder', () => {
+    const { runtime, key, fullUrl } = setup();
+    const baseUrl = fullUrl.slice(0, fullUrl.indexOf('?'));
+    expect(() => runtime.prepareFinalDraft({ key, mode: 'enabled', content: `授权：${baseUrl}` }))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('rejects malformed Markdown in an automatic final without a LinkRef placeholder', () => {
+    const { runtime, key, fullUrl } = setup();
+    expect(() => runtime.prepareFinalDraft({
+      key,
+      mode: 'enabled',
+      content: `[授权](${fullUrl}`,
+    })).toThrowError(expect.objectContaining({ code: 'link_ref_malformed_markdown' }));
+  });
+
   it('prefers an exact persisted draft after restart and never replaces it with replay text', () => {
     const { root, ledger, runtime, key, fullUrl, refId } = setup();
     const unresolved = `授权：{{botmux_link:${refId}}}`;
