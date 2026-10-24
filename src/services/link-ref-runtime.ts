@@ -4,7 +4,6 @@ import type { CliTurnPayload } from '../types.js';
 import { logger } from '../utils/logger.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { collectLinkRefCandidates } from './link-ref-extractor.js';
-import { enforceFinalLinkIntegrity } from './final-link-integrity.js';
 import { LinkRefLedger } from './link-ref-ledger.js';
 import { renderLinkRefCompanion } from './link-ref-presenter.js';
 import {
@@ -211,13 +210,8 @@ export function createLinkRefRuntime(
       const executable = findExecutableLinkRefs(content);
       if (executable.refIds.length === 0) {
         try {
-          const expanded = executable.expand(new Map());
-          enforceFinalLinkIntegrity({
-            payload: { text: expanded },
-            responseKind: 'final',
-            registeredUrls: ledger().listRegistered(key).map(entry => entry.originalUrl),
-          });
-          return { content: expanded, draftPending: false };
+          const resolved = resolveOutboundLinkRefs(ledger(), key, { text: content }, 'final');
+          return { content: resolved.text ?? content, draftPending: false };
         } catch (error) {
           if (error instanceof LinkRefError) throw error;
           throw new LinkRefError('link_ref_ledger_unavailable');

@@ -28,7 +28,7 @@ export interface McpHostDeliveryLinkRefRequest {
   turnId: string;
   dispatchAttempt?: number;
   linkRefMode: 'enabled';
-  responseKind?: 'final' | 'auxiliary';
+  responseKind: 'final' | 'auxiliary';
   payload: OutboundLinkRefPayload;
 }
 
@@ -139,6 +139,7 @@ export function resolveMcpHostDeliveryLinkRefsFromWorker(input: {
   if (!input.ownsWorkerSession
     || request.sessionId !== daemonSession.sessionId
     || !request.turnId
+    || (request.responseKind !== 'final' && request.responseKind !== 'auxiliary')
     || !boundedJsonValue(request.payload, LINK_REF_RESOLVE_MAX_BODY_BYTES)) {
     return { ok: false, error: 'link_ref_identity_mismatch' };
   }

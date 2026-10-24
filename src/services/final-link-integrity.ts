@@ -1,5 +1,6 @@
 import { extractHttpUrlSpans } from './link-ref-extractor.js';
 import type { OutboundLinkRefPayload } from './link-ref-resolver.js';
+import { markdownLiteralRanges } from './markdown-literal-ranges.js';
 import { LinkRefError } from './link-ref-types.js';
 
 export type LinkIntegrityResponseKind = 'progress' | 'final' | 'auxiliary';
@@ -47,9 +48,17 @@ function registeredEndpoints(urls: readonly string[]): RegisteredEndpoint[] {
 }
 
 function hasUnclosedInlineLinkDestination(text: string): boolean {
+  const literals = markdownLiteralRanges(text);
+  let literalIndex = 0;
   for (let offset = 0; offset < text.length;) {
     const marker = text.indexOf('](', offset);
     if (marker < 0) return false;
+    while (literalIndex < literals.length && literals[literalIndex]!.end <= marker) literalIndex += 1;
+    const literal = literals[literalIndex];
+    if (literal && literal.start <= marker && marker < literal.end) {
+      offset = literal.end;
+      continue;
+    }
     const destinationStart = marker + 2;
     const firstNonSpace = text.slice(destinationStart).search(/\S/u);
     if (firstNonSpace < 0) return true;
@@ -89,14 +98,17 @@ function hasUnclosedInlineLinkDestination(text: string): boolean {
 export function enforceFinalLinkIntegrity(input: {
   payload: OutboundLinkRefPayload;
   responseKind?: LinkIntegrityResponseKind;
-  registeredUrls: readonly string[];
+  registeredUrls: readonly string[] | (() => readonly string[]);
 }): void {
   if (input.responseKind !== 'final') return;
   const strings = payloadStrings(input.payload);
   if (strings.some(hasUnclosedInlineLinkDestination)) {
     throw new LinkRefError('link_ref_malformed_markdown');
   }
-  const endpoints = registeredEndpoints(input.registeredUrls);
+  const urls = typeof input.registeredUrls === 'function'
+    ? input.registeredUrls()
+    : input.registeredUrls;
+  const endpoints = registeredEndpoints(urls);
   if (endpoints.length === 0) return;
   for (const value of strings) {
     for (const candidate of extractHttpUrlSpans(value)) {

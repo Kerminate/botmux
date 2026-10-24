@@ -60,6 +60,29 @@ describe('registered-source final link integrity', () => {
   });
 
   it.each([
+    ['fenced code', ['```js', 'const x = observers[name](', '  arg,', ');', '```'].join('\n')],
+    ['inline code', 'Markdown 的未闭合链接标记是 `](`。'],
+    ['indented code', '    用 ]( 这个写法'],
+  ])('does not interpret ]( inside %s as Markdown link syntax', (_label, text) => {
+    expect(resolve(text, 'final', []).text).toBe(text);
+  });
+
+  it('still validates visible URLs inside code literals byte-for-byte', () => {
+    expect(() => resolve(['```text', baseUrl, '```'].join('\n'), 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('does not mistake an indented paragraph continuation for a code block', () => {
+    expect(() => resolve('正文继续\n    [示例](', 'final', []))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_malformed_markdown' }));
+  });
+
+  it('resumes inline literal detection immediately after an indented code block', () => {
+    const text = '    code block\n`Markdown 的未闭合链接标记是 ](`';
+    expect(resolve(text, 'final', []).text).toBe(text);
+  });
+
+  it.each([
     `[一](${fullUrl})\n[二](${fullUrl})`,
     `[括号](https://other.example.test/problem(foo))`,
     String.raw`[转义](https://other.example.test/problem\))`,
