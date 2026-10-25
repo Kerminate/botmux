@@ -67,6 +67,30 @@ describe('registered-source final link integrity', () => {
     expect(resolve(text, 'final', []).text).toBe(text);
   });
 
+  it.each([
+    ['ordered-list fence', [
+      '1. 改成这样：', '', '    ```js', '    observers[name](', '      value,', '    );', '    ```',
+    ].join('\n')],
+    ['bullet-list fence', [
+      '- 改成这样：', '', '    ```js', '    a](', '    ```',
+    ].join('\n')],
+    ['blockquote fence', [
+      '> 示例：', '>', '> ```js', '> observers[name](', '>   value,', '> );', '> ```',
+    ].join('\n')],
+    ['nested-blockquote fence', [
+      '> > 说明：', '> >', '> > ```js', '> > a](', '> > ```',
+    ].join('\n')],
+  ])('does not interpret ]( inside a closed %s as Markdown link syntax', (_label, text) => {
+    expect(resolve(text, 'final', []).text).toBe(text);
+  });
+
+  it('still reports malformed Markdown after an unclosed fence with the exact reason', () => {
+    const text = ['```js', 'const sample = true;', `[查看问题](${fullUrl}`].join('\n');
+
+    expect(() => resolve(text, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_malformed_markdown' }));
+  });
+
   it('still validates visible URLs inside code literals byte-for-byte', () => {
     expect(() => resolve(['```text', baseUrl, '```'].join('\n'), 'final'))
       .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));

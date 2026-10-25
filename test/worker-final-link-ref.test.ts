@@ -60,6 +60,26 @@ describe('automatic final LinkRef drafts', () => {
     })).toThrowError(expect.objectContaining({ code: 'link_ref_malformed_markdown' }));
   });
 
+  it.each([
+    ['ordered-list fence', [
+      '1. 改成这样：', '', '    ```js', '    observers[name](', '      value,', '    );', '    ```',
+    ].join('\n')],
+    ['bullet-list fence', [
+      '- 改成这样：', '', '    ```js', '    a](', '    ```',
+    ].join('\n')],
+    ['blockquote fence', [
+      '> 示例：', '>', '> ```js', '> observers[name](', '>   value,', '> );', '> ```',
+    ].join('\n')],
+    ['nested-blockquote fence', [
+      '> > 说明：', '> >', '> > ```js', '> > a](', '> > ```',
+    ].join('\n')],
+  ])('delivers an automatic final containing a closed %s', (_label, content) => {
+    const { runtime, key } = setup();
+
+    expect(runtime.prepareFinalDraft({ key, mode: 'enabled', content }))
+      .toEqual({ content, draftPending: false });
+  });
+
   it('validates a direct same-endpoint URL after expanding a LinkRef draft', () => {
     const { runtime, key, fullUrl, refId } = setup();
     const baseUrl = fullUrl.slice(0, fullUrl.indexOf('?'));

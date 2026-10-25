@@ -115,6 +115,34 @@ describe('LinkRef resolver', () => {
       .toContain('https://example.test/recovered');
   });
 
+  it('keeps a LinkRef literal inside a closed blockquote fence', () => {
+    const refId = register('https://example.test/private');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = ['> 示例：', '>', '> ```text', `> ${placeholder}`, '> ```'].join('\n');
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
+  });
+
+  it('expands a registered LinkRef after an unclosed blockquote fence', () => {
+    const refId = register('https://example.test/recovered');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = ['> ```text', '> unfinished', `> ${placeholder}`].join('\n');
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text)
+      .toContain('https://example.test/recovered');
+  });
+
+  it('rejects an unknown LinkRef after an unclosed blockquote fence', () => {
+    const text = [
+      '> ```text',
+      '> unfinished',
+      '> {{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+    ].join('\n');
+
+    expect(() => resolveOutboundLinkRefs(ledger, key, { text }))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_unknown' }));
+  });
+
   it('handles many unmatched fence candidates without rescanning the remaining document', () => {
     const refId = register('https://example.test/recovered');
     const placeholder = `{{botmux_link:${refId}}}`;

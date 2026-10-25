@@ -1,17 +1,22 @@
 import MarkdownIt from 'markdown-it';
+// markdown-it publishes this block rule at runtime but @types/markdown-it does
+// not declare individual rules. Keep the suppression beside the internal import
+// so every tsconfig that reaches this source sees the same typed wrapper below.
+// @ts-expect-error markdown-it/lib/rules_block/fence.mjs has no published declaration
+import markdownFence from 'markdown-it/lib/rules_block/fence.mjs';
+import type StateBlock from 'markdown-it/lib/rules_block/state_block.mjs';
+import type Token from 'markdown-it/lib/token.mjs';
 
-const FENCE_PATTERN = /^( {0,3})(`{3,}|~{3,})(.*)$/u;
 const MARKDOWN = new MarkdownIt();
+const CLOSED_FENCE_META = 'botmuxClosedFence';
 
 export interface MarkdownLiteralRange {
   start: number;
   end: number;
 }
 
-interface FenceLine extends MarkdownLiteralRange {
-  char: '`' | '~';
-  runLength: number;
-  canClose: boolean;
+interface FenceTokenMeta {
+  [CLOSED_FENCE_META]?: boolean;
 }
 
 function countRun(text: string, index: number, char: '`'): number {
@@ -25,64 +30,43 @@ function lineEnd(text: string, index: number): number {
   return newline < 0 ? text.length : newline;
 }
 
-function fencedLiteralRanges(text: string): MarkdownLiteralRange[] {
-  const fences: FenceLine[] = [];
-  for (let offset = 0; offset < text.length;) {
-    const end = lineEnd(text, offset);
-    const contentEnd = end > offset && text[end - 1] === '\r' ? end - 1 : end;
-    const fence = FENCE_PATTERN.exec(text.slice(offset, contentEnd));
-    if (fence) {
-      const run = fence[2]!;
-      fences.push({
-        start: offset,
-        end,
-        char: run[0] as '`' | '~',
-        runLength: run.length,
-        canClose: fence[3]!.trim() === '',
-      });
-    }
-    offset = end < text.length ? end + 1 : end;
-  }
-
-  const closerByFence = new Array<number | undefined>(fences.length);
-  const nearestCloser = {
-    '`': [] as Array<number | undefined>,
-    '~': [] as Array<number | undefined>,
-  };
-  for (let index = fences.length - 1; index >= 0; index -= 1) {
-    const fence = fences[index]!;
-    const nearestForChar = nearestCloser[fence.char];
-    closerByFence[index] = nearestForChar[fence.runLength];
-    if (fence.canClose) {
-      for (let runLength = 3; runLength <= fence.runLength; runLength += 1) {
-        nearestForChar[runLength] = index;
-      }
-    }
-  }
-
-  const ranges: MarkdownLiteralRange[] = [];
-  for (let index = 0; index < fences.length;) {
-    const closeIndex = closerByFence[index];
-    if (closeIndex === undefined) {
-      // An unmatched opener is ordinary model output, not a license to hide
-      // every LinkRef that follows it.
-      index += 1;
-      continue;
-    }
-    ranges.push({ start: fences[index]!.start, end: fences[closeIndex]!.end });
-    index = closeIndex + 1;
-  }
-  return ranges;
+function closesFence(state: StateBlock, line: number, markup: string): boolean {
+  if (line < 0 || state.sCount[line]! - state.blkIndent >= 4) return false;
+  let position = state.bMarks[line]! + state.tShift[line]!;
+  const end = state.eMarks[line]!;
+  const marker = markup.charCodeAt(0);
+  if (state.src.charCodeAt(position) !== marker) return false;
+  const runStart = position;
+  position = state.skipChars(position, marker);
+  if (position - runStart < markup.length) return false;
+  return state.skipSpaces(position) >= end;
 }
 
-function indentedLiteralRanges(text: string): MarkdownLiteralRange[] {
+MARKDOWN.block.ruler.at('fence', (state, startLine, endLine, silent) => {
+  const handled = markdownFence(state, startLine, endLine, silent);
+  if (!handled || silent) return handled;
+  const token = state.tokens.at(-1);
+  if (token?.type === 'fence') {
+    token.meta = {
+      ...(token.meta && typeof token.meta === 'object' ? token.meta : {}),
+      [CLOSED_FENCE_META]: closesFence(state, state.line - 1, token.markup),
+    } satisfies FenceTokenMeta;
+  }
+  return handled;
+}, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+
+function blockLiteralRanges(text: string): MarkdownLiteralRange[] {
   const lineStarts = [0];
   for (let index = 0; index < text.length; index += 1) {
     if (text[index] === '\n') lineStarts.push(index + 1);
   }
   return MARKDOWN.parse(text, {})
-    .filter(token => token.type === 'code_block' && token.map)
-    .map((token) => ({
+    .filter((token: Token) => token.map && (
+      token.type === 'code_block'
+      || (token.type === 'fence'
+        && (token.meta as FenceTokenMeta | null)?.[CLOSED_FENCE_META] === true)
+    ))
+    .map((token: Token) => ({
       start: lineStarts[token.map![0]] ?? text.length,
       end: lineEnd(text, lineStarts[Math.max(token.map![0], token.map![1] - 1)] ?? text.length),
     }));
@@ -150,7 +134,6 @@ function mergeRanges(ranges: MarkdownLiteralRange[]): MarkdownLiteralRange[] {
  * or inline-link syntax. Visible URLs remain outside this abstraction and are
  * still inspected by final-link integrity. */
 export function markdownLiteralRanges(text: string): MarkdownLiteralRange[] {
-  const fenced = fencedLiteralRanges(text);
-  const blocks = mergeRanges([...fenced, ...indentedLiteralRanges(text)]);
+  const blocks = mergeRanges(blockLiteralRanges(text));
   return mergeRanges([...blocks, ...inlineLiteralRanges(text, blocks)]);
 }
