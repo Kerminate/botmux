@@ -62,7 +62,7 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { publishWorkingDirRecovery } from './working-dir-recovery.js';
+import { onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
@@ -2945,6 +2945,17 @@ export async function handleCommand(
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        // A first message whose start was refused because the directory it fell
+        // back to is missing still holds the session; `/repo <路径>` picks the
+        // directory for it, like the recovery card (the no-card reply says so).
+        if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
+        if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
+          await sessionReply(
+            rootId,
+            t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+          );
+          break;
+        }
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
           await sessionReply(
@@ -3097,6 +3108,7 @@ export async function handleCommand(
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
+            current.workingDirRecovery = undefined;
             return { current, cardToWithdraw };
           });
           if (!started) return false;
@@ -3675,6 +3687,13 @@ export async function handleCommand(
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
+        break;
+      }
+
+      case '/dash': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, 'link', rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard link command handled`);
         break;
       }
 
@@ -6228,6 +6247,7 @@ export async function handleCommand(
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.dash', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
