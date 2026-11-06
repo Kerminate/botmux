@@ -1477,6 +1477,7 @@ async function handleManagedOriginAttestation(
         scheduleOperator,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
+        allowArbitraryMention: scheduleBot?.config.allowArbitraryMention === true,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
